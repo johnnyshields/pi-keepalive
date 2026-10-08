@@ -1,0 +1,14 @@
+pi-keepalive
+Copyright (c) 2026 johnnyshields
+
+This project ports the Keepalive cache controller from Agent Router:
+https://github.com/alexandernicholson/agent-router/tree/main/keepalive
+
+The keepalive budgeting logic, model-name matching and Anthropic price table
+are adapted from Agent Router, copyright (c) 2026 Agent Router contributors,
+licensed under the MIT License. The upstream license is retained in LICENSE.
+
+Comparison references (no code copied):
+https://github.com/luongnv89/pi-extensions/tree/main/extensions/cache-warm
+https://github.com/diousk/pi-warm-cache
+https://github.com/mackenney/pi-cache-ttl-config

@@ -1,0 +1,31 @@
+{
+  "name": "pi-keepalive",
+  "version": "0.1.0",
+  "description": "Prompt-cache countdown, Anthropic TTL control, cost-bounded keepalives and automatic compaction for pi.",
+  "type": "module",
+  "license": "MIT",
+  "author": "johnnyshields",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/johnnyshields/pi-keepalive.git"
+  },
+  "homepage": "https://github.com/johnnyshields/pi-keepalive#readme",
+  "bugs": {
+    "url": "https://github.com/johnnyshields/pi-keepalive/issues"
+  },
+  "keywords": ["pi-package", "pi-extension", "prompt-cache", "keepalive", "anthropic"],
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.ts"
+  },
+  "files": ["*.ts", "README.md", "LICENSE", "NOTICE"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
