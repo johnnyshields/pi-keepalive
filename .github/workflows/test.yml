@@ -19,3 +19,24 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: npm test
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install pinned test-only host runtimes outside the checkout
+        run: >-
+          npm install --prefix "$RUNNER_TEMP/pi-keepalive-host"
+          --ignore-scripts --no-audit --no-fund
+          @earendil-works/pi-coding-agent@1.0.2 pi-subagents@0.76.0
+      - run: npm run test:integration
+        env:
+          PI_KEEPALIVE_PI_ROOT: ${{ runner.temp }}/pi-keepalive-host/node_modules/@earendil-works/pi-coding-agent
+          PI_KEEPALIVE_SUBAGENTS_ROOT: ${{ runner.temp }}/pi-keepalive-host/node_modules/pi-subagents

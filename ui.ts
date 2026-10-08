@@ -94,10 +94,10 @@ function upkeepHint(theme: Theme, v: View): string {
 	const warms = v.mode === "warm" || v.mode === "warmcomp";
 	const parts: string[] = [];
 	if (warms && v.replay.ok && v.left !== null) {
-		if (v.left === Infinity) parts.push(paint(theme, "warm", "↻∞"));
-		else if (v.left > 0) parts.push(paint(theme, "warm", `↻${v.left}`));
+		if (v.left === Infinity) parts.push(paint(theme, "warm", "↻ ∞"));
+		else if (v.left > 0) parts.push(paint(theme, "warm", `↻ ${v.left}`));
 	}
-	if ((v.mode === "compact" || v.mode === "warmcomp") && v.compactable && v.left !== Infinity) parts.push(paint(theme, "compact", "➜ cmpt"));
+	if ((v.mode === "compact" || v.mode === "warmcomp") && v.compactable && v.left !== Infinity) parts.push(paint(theme, "compact", "➜ comp"));
 	return parts.join(" ");
 }
 
@@ -129,7 +129,7 @@ export function renderBar(theme: Theme, v: View, width: number): { line: string;
 	if (s.state === "compacted") {
 		const { before, after } = s.compacted ?? {};
 		const sizes = before !== undefined ? ` ${cacheTokens(before)}${after !== undefined ? ` → ${cacheTokens(after)}` : ""}` : "";
-		push(paint(theme, "compact", `cmpt ✓${sizes}`));
+		push(paint(theme, "compact", `comp ✓${sizes}`));
 		if (s.sample) push(" " + bar(theme, s.ratio, cacheGrade(s.sample)) + " " + percentText(theme, s.sample));
 	} else {
 		const recent = recentUsage(v.ledger) ?? s.sample;

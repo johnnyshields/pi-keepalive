@@ -36,7 +36,7 @@ Competing `cache_warming_decision` handlers can override each other.
 ## Cache bar
 
 ```text
-[ ◕ ] ⬥ warm TTL 5m ██████████ 96% ✕ 2 prefix · ETA ~3:44 · read 148.1k · write 5.7k · new 2 · ↻11 ➜ cmpt
+[ ◕ ] ⬥ warm TTL 5m ██████████ 96% ✕ 2 prefix · ETA ~3:44 · read 148.1k · write 5.7k · new 2 · ↻ 11 ➜ comp
 ```
 
 The bar sits above the editor and shows:
@@ -48,7 +48,7 @@ The bar sits above the editor and shows:
 - **Recent misses** and their causes: `prefix`, `expired`, `model`, `TTL`, or `cache`.
 - **Countdown.**
 - **The last request's tokens:** read from cache, written to cache, and sent uncached.
-- **What upkeep does next:** `↻N` keepalives left, then `➜ cmpt` (compact).
+- **What upkeep does next:** `↻ N` keepalives left, then `➜ comp` (compact).
 
 In fullscreen mode you can click the dial (opens the dashboard), the mode (cycles it), the TTL (toggles it) and the miss chip (opens the dashboard filtered to misses).
 
@@ -185,7 +185,7 @@ Claude Code-specific parts of the original are left out:
 
 ## Tests
 
-Tests use Node's built-in TypeScript support (Node 22.18+); no install is required.
+Unit tests use Node's built-in TypeScript support (Node 22.18+); no install is required.
 They cover cache accounting, pricing tiers and catalog failures, settings/trust
 and permissions, narrow-terminal rendering, async races and both subagent entry
 paths. Host/provider shims and temporary directories prevent tests from loading
@@ -196,6 +196,39 @@ npm test
 # Or:
 node --test tests/*.test.ts
 ```
+
+### Real foreground/background runtime tests
+
+A separate integration suite uses the real pi SDK and **pi-subagents child-session
+factory**, without the unit-test host shims. Foreground fixtures host a parent and
+multiple children in one process through `child.ts`. Background fixtures run in
+an isolated process, use `PI_SUBAGENT_CHILD=1`, and discover the installed
+extension normally. Both paths verify:
+
+- child TTLs without changing the parent's TTL or process environment;
+- forked parent state is not treated as the child's cache ledger;
+- byte-identical cached-prefix replay, with no synthetic conversation messages;
+- separate child budgets and resetting only the child that receives a real turn;
+- shutdown aborts an in-flight request and prevents late ledger writes;
+- actual SDK compaction runs once after the budget, then upkeep stops.
+
+CI runs both suites on Node 22 and 24. Integration dependencies are pinned and
+installed outside the checkout; they are not plugin runtime dependencies:
+
+```bash
+test_host="$(mktemp -d)"
+npm install --prefix "$test_host" --ignore-scripts --no-audit --no-fund \
+  @earendil-works/pi-coding-agent@1.0.2 pi-subagents@0.76.0
+PI_KEEPALIVE_PI_ROOT="$test_host/node_modules/@earendil-works/pi-coding-agent" \
+PI_KEEPALIVE_SUBAGENTS_ROOT="$test_host/node_modules/pi-subagents" \
+  npm run test:integration
+rm -rf "$test_host"
+```
+
+Setup downloads dependencies from npm. The tests themselves use a loopback-only
+fake Anthropic SSE endpoint, reject external fetches, discard inherited
+credentials, and use temporary agent directories. They exercise the native child
+session boundary, not external CLI agents or the full workflow orchestration UI.
 
 ## License and attribution
 

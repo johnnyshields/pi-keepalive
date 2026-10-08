@@ -21,6 +21,15 @@ test("narrow bars have no clickable regions beyond the visible text", () => {
 	}
 });
 
+test("upkeep labels use a spaced keepalive count and comp, including infinity", () => {
+	const warm = { ...view, mode: "warmcomp", left: 8, compactable: true, replay: { ok: true }, status: { ...view.status, state: "warm" } };
+	const line = renderBar(theme, warm, 200).line;
+	assert.ok(line.includes("↻ 8 ➜ comp"), line);
+	assert.equal(line.includes("cmpt"), false);
+	assert.ok(renderBar(theme, { ...warm, left: Infinity }, 200).line.includes("↻ ∞"));
+	assert.ok(renderBar(theme, { ...view, status: { ...view.status, state: "compacted", compacted: { before: 100_000, after: 10_000 } } }, 200).line.includes("comp ✓"));
+});
+
 test("dashboard respects narrow terminal widths and keyboard controls", () => {
 	let closes = 0, modes = 0, ttls = 0;
 	const dashboard = new Dashboard(theme, () => view, { close: () => { closes++; }, cycleMode: () => { modes++; }, toggleTtl: () => { ttls++; }, render: () => {} });
