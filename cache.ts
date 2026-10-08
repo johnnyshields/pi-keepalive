@@ -110,6 +110,9 @@ export function validSample(s: any): s is Sample {
 		["startedAt", "read", "write", "fresh", "output"].every((k) => count(s[k])) &&
 		(s.completedAt === undefined || count(s.completedAt)) &&
 		(s.requested === undefined || s.requested === "5m" || s.requested === "1h") &&
+		(s.declaredTtlMs === undefined || (count(s.declaredTtlMs) && s.declaredTtlMs > 0)) &&
+		(s.tokensBefore === undefined || count(s.tokensBefore)) &&
+		(s.tokensAfter === undefined || count(s.tokensAfter)) &&
 		(s.creation === undefined || validCreation(s.creation, s.write))
 	);
 }
@@ -156,7 +159,7 @@ function missOf(
 	if (s.requested === "1h" && (prior.requested ?? "5m") !== "1h") return "TTL changed";
 	const ttlMs = creationTtlMs(creation, declared);
 	if (!ttlMs || touchedAt === undefined) return "cache miss";
-	return s.startedAt - touchedAt > ttlMs ? "expired" : "prefix changed";
+	return s.startedAt - touchedAt >= ttlMs ? "expired" : "prefix changed";
 }
 
 export function buildLedger(input: Sample[]): Ledger {
@@ -171,6 +174,7 @@ export function buildLedger(input: Sample[]): Ledger {
 	};
 	/** Base for miss detection; a compaction replaces the conversation, so it resets. */
 	let missBase: Sample | undefined;
+	let cacheModel: string | undefined;
 	for (const s of samples) {
 		if (s.kind !== "compaction" || s.read + s.write + s.fresh + s.output > 0) ledger.totals.requests++;
 		ledger.totals.read += s.read;
@@ -180,10 +184,26 @@ export function buildLedger(input: Sample[]): Ledger {
 		if (s.kind === "compaction") {
 			ledger.compaction = s;
 			ledger.keepalives = [];
+			ledger.touchedAt = undefined;
+			ledger.creation = undefined;
+			ledger.declaredTtlMs = undefined;
 			missBase = undefined;
+			cacheModel = undefined;
 			continue;
 		}
 		if (s.kind === "real") s.miss = missOf(s, missBase, ledger.touchedAt, ledger.creation, ledger.declaredTtlMs);
+		if (cacheModel && !sameModel(cacheModel, s.model)) {
+			ledger.creation = undefined;
+			ledger.declaredTtlMs = undefined;
+			ledger.touchedAt = undefined;
+		}
+		cacheModel = s.model;
+		if (s.write > 0) {
+			ledger.creation = s.creation ?? null;
+			ledger.declaredTtlMs = s.declaredTtlMs;
+		} else if (ledger.declaredTtlMs === undefined) {
+			ledger.declaredTtlMs = s.declaredTtlMs;
+		}
 		if (s.read + s.write > 0) ledger.touchedAt = s.startedAt;
 		if (s.kind === "keepalive") {
 			ledger.keepalives.push(s);
@@ -193,12 +213,6 @@ export function buildLedger(input: Sample[]): Ledger {
 		missBase = s;
 		ledger.recent = [...ledger.recent, s].slice(-RATE_REQUESTS);
 		ledger.keepalives = [];
-		if (s.write > 0) {
-			ledger.creation = s.creation ?? null;
-			ledger.declaredTtlMs = s.declaredTtlMs;
-		} else if (ledger.declaredTtlMs === undefined) {
-			ledger.declaredTtlMs = s.declaredTtlMs;
-		}
 	}
 	return ledger;
 }
@@ -209,7 +223,7 @@ function resolveCreation(ledger: Ledger, sample: Sample, now: number): { creatio
 	const tokens = Math.max(1, sample.read + sample.write);
 	const declared = ledger.declaredTtlMs ?? sample.declaredTtlMs;
 	if (declared === TTL_MS["1h"]) return { creation: { fiveMinute: 0, oneHour: tokens }, basis: "declared" };
-	if (declared === TTL_MS["5m"]) return { creation: { fiveMinute: tokens, oneHour: 0 }, basis: "declared" };
+	if (declared !== undefined) return { creation: { fiveMinute: tokens, oneHour: 0 }, basis: "declared" };
 	if (sample.requested && (sample.completedAt === undefined || now - sample.completedAt < TTL_REPORT_MS)) {
 		const creation = sample.requested === "1h" ? { fiveMinute: 0, oneHour: tokens } : { fiveMinute: tokens, oneHour: 0 };
 		return { creation, basis: "awaiting" };
@@ -251,8 +265,8 @@ export function cacheStatus(ledger: Ledger | undefined, now: number, pendingAt?:
 	const lifetimes = parts
 		.filter((p) => p.tokens > 0)
 		.map((p) => ({ ...p, leftMs: Math.max(0, Math.min(p.ttlMs, anchor + p.ttlMs - now)) }));
-	const running = lifetimes.filter((p) => p.leftMs > 0).map((p) => p.leftMs);
-	const leftMs = running.length ? Math.min(...running) : 0;
+	// A mixed cache is only fully warm until its shortest-lived portion expires.
+	const leftMs = lifetimes.length ? Math.min(...lifetimes.map((p) => p.leftMs)) : 0;
 	return {
 		state: leftMs ? "warm" : "expired",
 		leftMs,
@@ -294,7 +308,7 @@ export function validPrices(value: any): value is Prices {
 	);
 }
 
-function writePrice(ledger: Ledger, prices: Prices, oneHour: boolean): number {
+function writePrice(prices: Prices, oneHour: boolean): number {
 	const fiveMinute = Math.max(1, prices.fiveMinute ?? 1);
 	return oneHour ? Math.max(fiveMinute, prices.oneHour ?? fiveMinute) : fiveMinute;
 }
@@ -314,12 +328,15 @@ export function keepalivesLeft(
 	const last = ledger?.last;
 	const prefix = last ? last.read + last.write : 0;
 	if (!ledger || !last || !prefix) return null;
-	if (limit !== undefined) return Math.max(0, limit - ledger.keepalives.length);
+	if (limit !== undefined) return limit === Infinity ? Infinity : count(limit) ? Math.max(0, limit - ledger.keepalives.length) : 0;
 	if (!validPrices(prices)) return 0;
-	const write = writePrice(ledger, prices, oneHour || (!!ledger.creation?.oneHour && !ledger.creation.fiveMinute));
-	const cost = (s: Sample) => s.read * prices.read + s.write * write + s.fresh + s.output * prices.output;
+	const write = writePrice(prices, oneHour || (!!ledger.creation?.oneHour && !ledger.creation.fiveMinute));
+	const cost = (s: Sample) => {
+		const hourTokens = s.creation?.oneHour ?? (s.requested === "1h" ? s.write : 0);
+		return s.read * prices.read + (s.write - hourTokens) * writePrice(prices, false) + hourTokens * writePrice(prices, true) + s.fresh + s.output * prices.output;
+	};
 	const spent = ledger.keepalives.reduce((sum, s) => sum + cost(s), 0);
-	const next = ledger.keepalives.length ? cost(ledger.keepalives.at(-1)!) : prefix * prices.read;
+	const next = ledger.keepalives.length ? cost(ledger.keepalives.at(-1)!) : prefix * prices.read + prices.output;
 	if (next <= 0) return null;
 	return Math.max(0, Math.floor((prefix * (write - prices.read) - spent) / next + 1e-9));
 }

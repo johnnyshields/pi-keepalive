@@ -14,9 +14,12 @@ Requires pi 1.0 or newer. Tested with pi 1.0.2.
 pi install git:github.com/johnnyshields/pi-keepalive
 ```
 
-Then run `/reload` or restart pi. Upkeep is **off by default**; enable it with
-`/keepalive mode warmcomp` (or `warm` for warming without compaction).
-Keepalives are billable provider requests.
+Then run `/reload` or restart pi. New sessions use **`warmcomp` by default**:
+price-bounded keepalives followed by compaction for conversations at or above
+100k tokens. **Keepalives and compactions are billable provider requests.**
+Use `/keepalive mode off` to disable upkeep for the current session, or set
+`cache_upkeep` to `off` in `/keepalive-settings` to change the default.
+Explicit settings and saved session overrides are preserved.
 
 For a local checkout:
 
@@ -73,10 +76,10 @@ Each mode acts `upkeep_lead_seconds` (default 30) before the TTL ends. It acts o
 
 | Mode | Action |
 |---|---|
-| `off` (default) | Nothing is sent. |
-| `warm` | A keepalive: the last request replayed exactly with a one-token output cap. It reads the whole cached prefix (which refreshes it) and writes nothing. |
+| `off` | Nothing is sent. |
+| `warm` | A keepalive: the last request replayed exactly with a one-token output cap. A cache hit reads and refreshes the cached prefix. Unexpected provider misses can still incur writes; these count against the price-based budget. |
 | `compact` | `ctx.compact()` if the conversation is at or over `compact_threshold` (default 100k). Smaller conversations are left to expire. |
-| `warmcomp` | Keepalives until the keepalive limit, then compact as in `compact`. |
+| `warmcomp` (default) | Keepalives until the keepalive limit, then compact as in `compact`. |
 
 **Keepalive limit** (`keepalive_limit`):
 
@@ -87,7 +90,8 @@ Each mode acts `upkeep_lead_seconds` (default 30) before the TTL ends. It acts o
 **Keepalive replay details:**
 
 - **Budget thinking.** Models that use budget-based thinking (e.g. Haiku 4.5) keep their `budget_tokens`, because the cache key depends on it. The stream is aborted as soon as `message_start` reports usage. Providers may bill tokens generated before cancellation that the stream did not report; displayed spend is an estimate.
-- **Real turns take priority.** Starting a real turn cancels an in-flight keepalive. Thinking-level changes invalidate the captured request until the next real turn.
+- **Real turns take priority.** Starting a real turn cancels an in-flight keepalive. Model/thinking changes, branch navigation, compaction and shutdown invalidate the captured request. Late replies cannot update another session's ledger.
+- **No cold replays.** Expired caches, disabled cache markers, queued work, active requests and in-progress compactions cannot trigger a keepalive. Safety checks run again after an asynchronous price lookup.
 - **Per-session budgets.** There is no cross-session concurrency or spending cap.
 - **Anthropic Messages only.** Keepalives work only on Anthropic Messages APIs. Elsewhere `warmcomp` goes straight to compacting.
 
@@ -98,16 +102,45 @@ Each mode acts `upkeep_lead_seconds` (default 30) before the TTL ends. It acts o
 - **What `default` means.** The TTL is `cache_ttl` / `subagent_cache_ttl`. Their `default` value follows pi: 1h with `PI_CACHE_RETENTION=long`, otherwise 5m.
 - **How it's applied.** The extension rewrites `cache_control.ttl` in the outgoing Anthropic payload (`before_provider_request`), so the choice applies to the next request and its keepalives.
 - **Where it doesn't apply.** Models that set `compat.supportsLongCacheRetention: false` are left alone, and so are non-Anthropic APIs.
-- **Subagents.** `pi-subagents` children (`PI_SUBAGENT_CHILD=1`) use `subagent_cache_ttl` and run no upkeep.
+- **Subagents.** Children have the same warming, compaction, budgets and native-warmer coordination as the parent when this extension is loaded. They inherit `cache_upkeep`, use `subagent_cache_ttl`, and have no cache bar. Each child has an independent ledger and budget, including when its context was forked from the parent; idle upkeep does not keep its process alive.
 
-1h writes cost 2× input instead of 1.25×. Switching a conversation from 5m to 1h writes it once at that price. The miss is labelled **TTL changed**.
+1h writes cost 2× input instead of 1.25×. The choice applies to subsequent requests; existing entries may still be read with their original TTL. The countdown follows reported write metadata rather than assuming a toggle rewrote the cache.
+
+### Loading in pi-subagents
+
+Background children normally discover installed extensions and are identified by
+`PI_SUBAGENT_CHILD=1`. Foreground children run inside the parent process and do
+**not** inherit ambient extensions. Use the explicit `child.ts` entry point for
+those children; it applies the subagent TTL without changing process-wide environment.
+
+In an agent's frontmatter:
+
+```yaml
+subagentOnlyExtensions: /absolute/path/to/pi-keepalive/child.ts
+```
+
+Or set a shared default in pi's `settings.json` (preserving any existing entries):
+
+```json
+{
+  "subagents": {
+    "defaultSubagentOnlyExtensions": ["/absolute/path/to/pi-keepalive/child.ts"]
+  }
+}
+```
+
+Use the child entry point as the **only** copy in that child's extension list.
+If background ambient discovery would also load `index.ts`, use an explicit
+`extensions` allowlist containing `child.ts` instead of adding a second copy.
+Per-agent extension overrides and capability ceilings still apply. External CLI
+agents are not pi sessions and cannot load this extension.
 
 ## pi's built-in cache warmer
 
 pi's own `cacheWarming` (default `streaming`) refreshes the cache during active runs, e.g. during a long build. Keepalive leaves that alone, with two exceptions:
 
 - **Idle refreshes:** when an upkeep mode is on, keepalive vetoes pi's idle refreshes (`cache_warming_decision` → `stop`) so the cache is never warmed twice.
-- **1h TTL:** keepalive also stops pi's streaming refreshes on a 1h TTL. pi would otherwise assume 5m and refresh every 4.5 minutes.
+- **TTL schedule mismatches:** if the selected TTL differs from `PI_CACHE_RETENTION`, keepalive vetoes native refreshes. A native 5m schedule would over-refresh a 1h entry; a native 1h schedule could replay an expired 5m entry. To retain native streaming upkeep, keep the two settings aligned.
 
 pi's warmer refreshes appear in the history as `pi warm`.
 
@@ -127,7 +160,7 @@ Keepalive budgets use prices as multiples of the model's input price. The source
 "keepalive": {
   "cache_ttl": "default",
   "subagent_cache_ttl": "default",
-  "cache_upkeep": "off",
+  "cache_upkeep": "warmcomp",
   "keepalive_limit": "default",
   "compact_threshold": "100k",
   "upkeep_lead_seconds": 30,
@@ -153,6 +186,10 @@ Claude Code-specific parts of the original are left out:
 ## Tests
 
 Tests use Node's built-in TypeScript support (Node 22.18+); no install is required.
+They cover cache accounting, pricing tiers and catalog failures, settings/trust
+and permissions, narrow-terminal rendering, async races and both subagent entry
+paths. Host/provider shims and temporary directories prevent tests from loading
+credentials, sending billable requests or modifying real pi settings.
 
 ```bash
 npm test

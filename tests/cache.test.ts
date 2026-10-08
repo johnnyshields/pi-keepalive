@@ -12,6 +12,7 @@ import {
 	recentMisses,
 	reportedCreation,
 	type Sample,
+	validSample,
 } from "../cache.ts";
 import { anthropicPrices, modelKey, registryPrices } from "../prices.ts";
 
@@ -114,11 +115,11 @@ test("default keepalive budget: keep warming while cheaper than rewriting the ca
 	const table = anthropicPrices("claude-opus-5-5")!; // 4 / 20 / 0.2 / 5 / 8
 	assert.ok(Math.abs(table.read - 0.05) < 1e-9 && Math.abs(table.fiveMinute! - 1.25) < 1e-9 && table.oneHour === 2);
 	const ledger = buildLedger([real(0, 0, 200_000)]);
-	assert.equal(keepalivesLeft(ledger, table), 24); // (1.25 - 0.05) / 0.05
+	assert.equal(keepalivesLeft(ledger, table), 23); // reserve one output token as well as cache reads
 	const registry = registryPrices({ api: "anthropic-messages", provider: "pantheon", id: "claude-opus-5-5", cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 } })!;
 	assert.equal(keepalivesLeft(ledger, registry), 11); // (1.25 - 0.1) / 0.1
 	// on a 1h cache the rewrite is priced at the 1h write price (2×)
-	assert.equal(keepalivesLeft(ledger, registry, undefined, true), 19);
+	assert.equal(keepalivesLeft(ledger, registry, undefined, true), 18);
 	// a numeric limit ignores prices; infinite never runs out
 	const warmed = buildLedger([real(0, 0, 200_000), keepalive(M, 200_000), keepalive(2 * M, 200_000)]);
 	assert.equal(keepalivesLeft(warmed, null, 12), 10);

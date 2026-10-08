@@ -8,9 +8,10 @@
  * Model-name matching is ported from agent-router keepalive (lib/model-match.js).
  */
 import { mkdirSync } from "node:fs";
-import { open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { Prices } from "./cache.ts";
+import type { Prices, Sample } from "./cache.ts";
 import { validPrices } from "./cache.ts";
 
 export const ANTHROPIC_PRICES_URL = "https://platform.claude.com/docs/en/build-with-claude/prompt-caching#pricing";
@@ -148,17 +149,25 @@ export function matchPrices(index: Map<string, IndexedListing[]>, model: unknown
 const anthropicIndex = priceIndex(ANTHROPIC_PRICES);
 
 /** Prices from pi's own model definition (what pi uses to bill the session). */
-export function registryPrices(model: any, contextTokens = 0): Prices | null {
+function registryRates(model: any, contextTokens: number): { rates: any; threshold: number } | null {
 	let rates = model?.cost;
 	if (!rates || !price(rates.input) || rates.input <= 0) return null;
 	let threshold = -1;
-	for (const tier of model.cost.tiers ?? []) {
-		if (contextTokens > tier.inputTokensAbove && tier.inputTokensAbove > threshold) {
+	for (const tier of Array.isArray(model.cost.tiers) ? model.cost.tiers : []) {
+		if (price(tier?.inputTokensAbove) && contextTokens > tier.inputTokensAbove && tier.inputTokensAbove > threshold &&
+			price(tier.input) && tier.input > 0 && price(tier.output) && price(tier.cacheRead)) {
 			rates = tier;
 			threshold = tier.inputTokensAbove;
 		}
 	}
 	if (!price(rates.output) || !price(rates.cacheRead)) return null;
+	return { rates, threshold };
+}
+
+export function registryPrices(model: any, contextTokens = 0): Prices | null {
+	const selected = registryRates(model, contextTokens);
+	if (!selected) return null;
+	const { rates, threshold } = selected;
 	const anthropic = model.api === "anthropic-messages";
 	return {
 		read: rates.cacheRead / rates.input,
@@ -168,6 +177,17 @@ export function registryPrices(model: any, contextTokens = 0): Prices | null {
 		...(anthropic ? { oneHour: 2 } : {}),
 		listing: `${model.provider}/${model.id}${threshold >= 0 ? ` (>${Math.round(threshold / 1000)}k tier)` : ""}`,
 	};
+}
+
+/** Estimated USD using the same context tier as pi. Missing prices are unknown, not zero. */
+export function sampleCost(model: any, sample: Sample): number | null {
+	const selected = registryRates(model, sample.read + sample.write + sample.fresh);
+	if (!selected || (sample.write > 0 && !price(selected.rates.cacheWrite))) return null;
+	const { rates } = selected;
+	const hour = model.api === "anthropic-messages" ? sample.creation?.oneHour ?? (sample.requested === "1h" ? sample.write : 0) : 0;
+	const total = (sample.read * rates.cacheRead + (sample.write - hour) * (rates.cacheWrite ?? 0) + hour * 2 * rates.input +
+		sample.fresh * rates.input + sample.output * rates.output) / 1e6;
+	return Number.isFinite(total) && total >= 0 ? total : null;
 }
 
 export function anthropicPrices(modelId: string): Prices | null {
@@ -217,21 +237,33 @@ async function readCatalog(file: string): Promise<CatalogFile | null> {
 }
 
 async function writeAtomic(file: string, value: unknown) {
-	const tmp = `${file}.${process.pid}.tmp`;
-	await writeFile(tmp, JSON.stringify(value));
-	await rename(tmp, file);
+	const tmp = `${file}.${randomUUID()}.tmp`;
+	try {
+		await writeFile(tmp, JSON.stringify(value), { flag: "wx", mode: 0o600 });
+		await rename(tmp, file);
+	} finally {
+		await unlink(tmp).catch(() => {});
+	}
 }
 
 async function lease(file: string, now: number, retry = true): Promise<boolean> {
 	try {
 		const handle = await open(file, "wx", 0o600);
-		await handle.writeFile(String(now));
-		await handle.close();
+		try {
+			await handle.writeFile(String(now));
+		} finally {
+			await handle.close();
+		}
 		return true;
 	} catch (error: any) {
 		if (error?.code !== "EEXIST" || !retry) return false;
-		const at = Number(await readFile(file, "utf8").catch(() => ""));
-		if (Number.isFinite(at) && now - at < LEASE_MS) return false;
+		const content = await readFile(file, "utf8").catch(() => undefined);
+		if (content === undefined) return false; // another owner may be releasing/replacing the lease
+		const parsed = Number(content);
+		// A newly created lock can be empty until its owner's write completes.
+		const at = content.trim() && Number.isFinite(parsed) && parsed <= now
+			? parsed : (await stat(file).catch(() => undefined))?.mtimeMs;
+		if (at === undefined || now - at < LEASE_MS) return false;
 		await unlink(file).catch(() => {});
 		return lease(file, now, false);
 	}
@@ -273,9 +305,10 @@ export async function modelsDevCatalog(root: string, allowNetwork: boolean, now 
 	mkdirSync(root, { recursive: true });
 	const file = join(root, "models-dev.json");
 	let cached = await readCatalog(file);
-	const listed = (v: CatalogFile | null) => Array.isArray(v?.entries) && Number.isSafeInteger(v?.fetchedAt);
-	const fresh = (v: CatalogFile | null) => listed(v) && now - v!.fetchedAt! < FRESH_MS;
-	const waiting = Number.isSafeInteger(cached?.failedAt) && now - cached!.failedAt! < RETRY_MS;
+	const listed = (v: CatalogFile | null) => Array.isArray(v?.entries) && v.entries.some((e) => Array.isArray(e) && usable(e)) &&
+		Number.isSafeInteger(v?.fetchedAt) && v!.fetchedAt! >= 0;
+	const fresh = (v: CatalogFile | null) => listed(v) && now >= v!.fetchedAt! && now - v!.fetchedAt! < FRESH_MS;
+	const waiting = Number.isSafeInteger(cached?.failedAt) && now >= cached!.failedAt! && now - cached!.failedAt! < RETRY_MS;
 	if (!fresh(cached) && !waiting && allowNetwork) {
 		const lock = join(root, "models-dev.lock");
 		if (await lease(lock, now)) {

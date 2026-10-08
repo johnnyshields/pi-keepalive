@@ -3,7 +3,8 @@
  * (global ~/.pi/agent/settings.json, overridable per project in .pi/settings.json),
  * next to pi's own settings.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { parseLimit, parseTokens, type Ttl, type Upkeep, UPKEEP_MODES } from "./cache.ts";
@@ -34,7 +35,7 @@ export interface KeepaliveSettings {
 export const DEFAULTS: KeepaliveSettings = {
 	cache_ttl: "default",
 	subagent_cache_ttl: "default",
-	cache_upkeep: "off",
+	cache_upkeep: "warmcomp",
 	keepalive_limit: "default",
 	compact_threshold: "100k",
 	upkeep_lead_seconds: 30,
@@ -60,7 +61,7 @@ function readJson(path: string): Record<string, any> | null {
 const ttlSetting = (v: unknown): TtlSetting | undefined => (v === "default" || v === "5m" || v === "1h" ? v : undefined);
 
 function normalize(raw: any): Partial<KeepaliveSettings> {
-	if (!raw || typeof raw !== "object") return {};
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
 	const out: Partial<KeepaliveSettings> = {};
 	if (ttlSetting(raw.cache_ttl)) out.cache_ttl = raw.cache_ttl;
 	if (ttlSetting(raw.subagent_cache_ttl)) out.subagent_cache_ttl = raw.subagent_cache_ttl;
@@ -94,15 +95,20 @@ export function saveSettings(cwd: string, patch: Partial<KeepaliveSettings>, pro
 	const path = useProject ? projectPath : globalSettingsPath();
 	const settings = useProject ? project : readJson(path);
 	if (!settings) return null; // unreadable JSON: never overwrite it
-	settings[KEY] = { ...(settings[KEY] ?? {}), ...patch };
+	const current = settings[KEY];
+	settings[KEY] = { ...(current && typeof current === "object" && !Array.isArray(current) ? current : {}), ...normalize(patch) };
+	const tmp = `${path}.keepalive-${randomUUID()}.tmp`;
 	try {
 		mkdirSync(dirname(path), { recursive: true });
-		const tmp = `${path}.keepalive-${process.pid}.tmp`;
-		writeFileSync(tmp, JSON.stringify(settings, null, 2) + "\n");
+		// The whole file may contain credentials: never broaden its permissions.
+		const mode = existsSync(path) ? statSync(path).mode & 0o777 : 0o600;
+		writeFileSync(tmp, JSON.stringify(settings, null, 2) + "\n", { flag: "wx", mode });
 		renameSync(tmp, path);
 		return path;
 	} catch {
 		return null;
+	} finally {
+		try { unlinkSync(tmp); } catch { /* renamed or never created */ }
 	}
 }
 

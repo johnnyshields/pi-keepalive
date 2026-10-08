@@ -156,7 +156,9 @@ export function renderBar(theme: Theme, v: View, width: number): { line: string;
 	const hint = upkeepHint(theme, v);
 	if (hint) tail.push(hint);
 	if (tail.length) push(theme.fg("dim", " · ") + tail.join(theme.fg("dim", " · ")));
-	return { line: truncateToWidth(line, width), segments };
+	const clipped = truncateToWidth(line, Math.max(0, width));
+	const columns = Math.min(Math.max(0, width), visibleWidth(clipped));
+	return { line: clipped, segments: segments.filter((s) => s.from < columns).map((s) => ({ ...s, to: Math.min(s.to, columns) })) };
 }
 
 // ------------------------------------------------------------------ dashboard
@@ -286,21 +288,28 @@ export function renderDashboard(theme: Theme, v: View, filter: RequestFilter, wi
 export class Dashboard {
 	filter: RequestFilter;
 	private scroll = 0;
+	private theme: Theme;
+	private view: () => View;
+	private actions: { cycleMode(): void; toggleTtl(): void; close(): void; render(): void };
 	constructor(
-		private theme: Theme,
-		private view: () => View,
-		private actions: { cycleMode(): void; toggleTtl(): void; close(): void; render(): void },
+		theme: Theme,
+		view: () => View,
+		actions: { cycleMode(): void; toggleTtl(): void; close(): void; render(): void },
 		filter: RequestFilter = "all",
 	) {
+		this.theme = theme;
+		this.view = view;
+		this.actions = actions;
 		this.filter = filter;
 	}
 	render(width: number): string[] {
-		const body = renderDashboard(this.theme, this.view(), this.filter, Math.max(20, width - 4));
+		const inner = Math.max(0, width - 4);
+		const body = renderDashboard(this.theme, this.view(), this.filter, inner);
 		const max = Math.max(0, body.length - 40);
 		this.scroll = Math.min(this.scroll, max);
 		const visible = body.slice(this.scroll, this.scroll + 40);
 		const border = (t: string) => this.theme.fg("borderMuted", t);
-		const inner = Math.max(20, width - 4);
+		if (width < 4) return visible.map((l) => truncateToWidth(l, Math.max(0, width)));
 		return [
 			border(`╭${"─".repeat(inner + 2)}╮`),
 			...visible.map((l) => `${border("│")} ${pad(l, inner)} ${border("│")}`),

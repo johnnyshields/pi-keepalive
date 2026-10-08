@@ -29,7 +29,7 @@ import {
 	UPKEEP_MODES,
 	validSample,
 } from "./cache.ts";
-import { lookUpPrices } from "./prices.ts";
+import { lookUpPrices, sampleCost } from "./prices.ts";
 import { dataDir, DEFAULTS, type KeepaliveSettings, limitOf, loadSettings, saveSettings, thresholdOf } from "./settings.ts";
 import { type BarSegment, Dashboard, GUIDE, renderBar, type RequestFilter, type View } from "./ui.ts";
 
@@ -46,6 +46,7 @@ interface Snapshot {
 	modelId: string;
 	api: string;
 	capturedAt: number;
+	confirmed: boolean;
 }
 
 interface PendingRequest {
@@ -59,6 +60,7 @@ interface PendingRequest {
 	done?: boolean;
 	startUsage?: any;
 	deltaUsage?: any;
+	snapshot?: Snapshot;
 }
 
 // ------------------------------------------------------------ payload helpers
@@ -73,6 +75,7 @@ function cacheControls(p: any): any[] {
 	const visit = (block: any) => {
 		if (block && typeof block === "object" && block.cache_control && typeof block.cache_control === "object") out.push(block.cache_control);
 	};
+	visit(p); // Anthropic also supports request-level automatic caching.
 	if (Array.isArray(p.system)) p.system.forEach(visit);
 	if (Array.isArray(p.tools)) p.tools.forEach(visit);
 	for (const m of p.messages ?? []) {
@@ -122,8 +125,8 @@ const uid = (prefix: string) => `${prefix}:${Date.now().toString(36)}:${Math.ran
 
 // ------------------------------------------------------------------ extension
 
-export default function keepalive(pi: ExtensionAPI) {
-	const isChild = process.env.PI_SUBAGENT_CHILD === "1";
+export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolean } = {}) {
+	const isChild = options.subagent === true || process.env.PI_SUBAGENT_CHILD === "1";
 
 	let ctx: ExtensionContext | undefined;
 	let settings: KeepaliveSettings = DEFAULTS;
@@ -136,6 +139,11 @@ export default function keepalive(pi: ExtensionAPI) {
 	let actedAt: number | undefined;
 	let busy: "keepalive" | "compact" | undefined;
 	let agentRunning = false;
+	let compacting = false;
+	let nativeRefresh = false;
+	let revision = 0;
+	let sessionRevision = 0;
+	let upkeepPlan: object | undefined;
 	let compactStartedAt: number | undefined;
 	let keepaliveAbort: AbortController | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
@@ -153,13 +161,24 @@ export default function keepalive(pi: ExtensionAPI) {
 		ledger = buildLedger(samples);
 	}
 
+	function cancelReplay(clearSnapshot = true) {
+		revision++;
+		nativeRefresh = false;
+		upkeepPlan = undefined;
+		keepaliveAbort?.abort();
+		keepaliveAbort = undefined;
+		if (busy === "keepalive") busy = undefined;
+		if (clearSnapshot) snapshot = undefined;
+	}
+
 	function record(sample: Sample) {
 		if (!validSample(sample)) return;
+		if (samples.some((s) => s.id === sample.id)) return;
 		samples.push(sample);
 		rebuild();
 		try {
 			const { miss: _miss, ...persisted } = sample;
-			pi.appendEntry(SAMPLE_ENTRY, persisted);
+			pi.appendEntry(SAMPLE_ENTRY, { ...persisted, ownerSession: ctx?.sessionManager.getSessionId() });
 		} catch {
 			// Persistence is best-effort.
 		}
@@ -168,25 +187,34 @@ export default function keepalive(pi: ExtensionAPI) {
 
 	function persistState() {
 		try {
-			pi.appendEntry(STATE_ENTRY, { mode, ttl: ttlChoice ?? null });
+			pi.appendEntry(STATE_ENTRY, { mode, ttl: ttlChoice ?? null, ownerSession: ctx?.sessionManager.getSessionId() });
 		} catch {
 			// best-effort
 		}
 	}
 
 	function restore(c: ExtensionContext) {
+		cancelReplay();
+		sessionRevision++;
+		busy = undefined;
+		compacting = false;
+		agentRunning = false;
+		compactStartedAt = undefined;
+		price = undefined;
+		notes.clear();
 		samples = [];
-		mode = isChild ? "off" : settings.cache_upkeep;
+		mode = settings.cache_upkeep;
 		ttlChoice = undefined;
 		for (const entry of c.sessionManager.getBranch() as any[]) {
 			if (entry?.type !== "custom") continue;
+			// Forked-context children must not inherit the parent's cache ledger or session overrides.
+			if (isChild && entry.data?.ownerSession !== c.sessionManager.getSessionId()) continue;
 			if (entry.customType === SAMPLE_ENTRY && validSample(entry.data)) samples.push(entry.data);
 			else if (entry.customType === STATE_ENTRY && entry.data) {
 				if (UPKEEP_MODES.includes(entry.data.mode)) mode = entry.data.mode;
 				ttlChoice = entry.data.ttl === "5m" || entry.data.ttl === "1h" ? entry.data.ttl : undefined;
 			}
 		}
-		if (isChild) mode = "off";
 		snapshot = undefined;
 		pending = [];
 		actedAt = undefined;
@@ -211,7 +239,8 @@ export default function keepalive(pi: ExtensionAPI) {
 	function declaredTtlMs(model: any, requested: Ttl | undefined): number | undefined {
 		const tier = requested ? (requested === "1h" ? "long" : "short") : process.env.PI_CACHE_RETENTION === "long" ? "long" : "short";
 		const seconds = model?.promptCache?.[tier];
-		return typeof seconds === "number" && seconds > 0 ? Math.round(seconds * 1000) : undefined;
+		const ms = typeof seconds === "number" ? Math.round(seconds * 1000) : NaN;
+		return Number.isSafeInteger(ms) && ms > 0 ? ms : undefined;
 	}
 
 	// --------------------------------------------------------------- prices
@@ -221,7 +250,7 @@ export default function keepalive(pi: ExtensionAPI) {
 		const last = ledger.last;
 		if (!model || !last) return;
 		const contextTokens = last.read + last.write + last.fresh;
-		const key = `${model.provider}/${model.id}`;
+		const key = `${model.provider}/${model.id}:${contextTokens}`;
 		if (price?.key === key && (price.lookup || now() - price.at < PRICE_REFRESH_MS)) return price.lookup;
 		const entry: NonNullable<typeof price> = { key, value: price?.key === key ? price.value : null, at: now() };
 		price = entry;
@@ -237,7 +266,7 @@ export default function keepalive(pi: ExtensionAPI) {
 			.finally(() => {
 				entry.at = now();
 				entry.lookup = undefined;
-				redraw();
+				if (price === entry) redraw();
 			});
 		return entry.lookup;
 	}
@@ -248,12 +277,16 @@ export default function keepalive(pi: ExtensionAPI) {
 		if (!snapshot) return { ok: false, reason: "no request captured since start, compaction, branch or thinking change" };
 		if (snapshot.api !== "anthropic-messages") return { ok: false, reason: `not supported for ${snapshot.api}` };
 		const model = ctx?.model;
-		if (model && (model.provider !== snapshot.provider || model.id !== snapshot.modelId))
+		if (!model || model.provider !== snapshot.provider || model.id !== snapshot.modelId)
 			return { ok: false, reason: "model changed since the last request" };
+		if (!payloadTtl(snapshot.payload)) return { ok: false, reason: "the request disabled prompt caching" };
+		if (!snapshot.confirmed || snapshot.capturedAt !== ledger.last?.startedAt)
+			return { ok: false, reason: "the latest request did not confirm cache activity" };
 		return { ok: true };
 	}
 
 	async function sendKeepalive(c: ExtensionContext) {
+		const runRevision = revision;
 		const snap = snapshot!;
 		const model = c.modelRegistry.find(snap.provider, snap.modelId);
 		if (!model) {
@@ -295,14 +328,18 @@ export default function keepalive(pi: ExtensionAPI) {
 				} as any,
 			);
 			const result: any = await stream.result();
-			if (!start && result?.errorMessage) notes.set("keepalive", `last keepalive failed: ${String(result.errorMessage).slice(0, 160)}`);
+			if (runRevision === revision && !start && result?.errorMessage) notes.set("keepalive", `last keepalive failed: ${String(result.errorMessage).slice(0, 160)}`);
 		} catch (error: any) {
-			if (!start) notes.set("keepalive", `last keepalive failed: ${String(error?.message ?? error).slice(0, 160)}`);
+			if (runRevision === revision && !start) notes.set("keepalive", `last keepalive failed: ${String(error?.message ?? error).slice(0, 160)}`);
 		} finally {
 			clearTimeout(timeout);
-			if (keepaliveAbort === controller) keepaliveAbort = undefined;
-			busy = undefined;
+			if (keepaliveAbort === controller) {
+				keepaliveAbort = undefined;
+				busy = undefined;
+			}
 		}
+		// A late response must not update a different branch/model/session or supersede a real turn.
+		if (runRevision !== revision || !ctx) return;
 		if (!start) {
 			redraw();
 			return;
@@ -326,6 +363,7 @@ export default function keepalive(pi: ExtensionAPI) {
 	}
 
 	function compact(c: ExtensionContext) {
+		const runSession = sessionRevision;
 		const before = ledger.last ? ledger.last.read + ledger.last.write + ledger.last.fresh : 0;
 		busy = "compact";
 		compactStartedAt = now();
@@ -334,19 +372,27 @@ export default function keepalive(pi: ExtensionAPI) {
 			c.compact({
 				customInstructions: undefined,
 				onComplete: () => {
+					if (runSession !== sessionRevision || !ctx) return;
 					busy = undefined;
+					compacting = false;
+					compactStartedAt = undefined;
 					notes.delete("compact");
 					if (c.hasUI) c.ui.notify(`Keepalive compacted the conversation (${cacheTokens(before)} tokens) before its prompt cache expired.`, "info");
 					redraw();
 				},
 				onError: (error: Error) => {
+					if (runSession !== sessionRevision || !ctx) return;
 					busy = undefined;
+					compacting = false;
+					compactStartedAt = undefined;
 					notes.set("compact", `compaction refused: ${error.message.slice(0, 160)}`);
 					redraw();
 				},
 			});
 		} catch (error: any) {
 			busy = undefined;
+			compacting = false;
+			compactStartedAt = undefined;
 			notes.set("compact", `compaction could not start: ${String(error?.message ?? error).slice(0, 160)}`);
 		}
 	}
@@ -359,37 +405,45 @@ export default function keepalive(pi: ExtensionAPI) {
 
 	async function upkeep() {
 		const c = ctx;
-		if (!c || isChild || mode === "off" || busy) return;
-		if (agentRunning || !c.isIdle() || c.hasPendingMessages() || pendingReal().length) return;
+		if (!c || mode === "off" || busy || compacting || upkeepPlan) return;
+		const idle = () => !agentRunning && c.isIdle() && !c.hasPendingMessages() && !pendingReal().length;
+		if (!idle()) return;
 		const status = cacheStatus(ledger, now());
 		if (status.state !== "warm" || (status.basis !== "reported" && status.basis !== "declared")) return;
-		const leadMs = settings.upkeep_lead_seconds * 1000;
-		if (!status.leftMs || status.leftMs > leadMs) return;
+		if (!status.leftMs || status.leftMs > settings.upkeep_lead_seconds * 1000) return;
 		if (ledger.touchedAt === undefined || actedAt === ledger.touchedAt) return;
-		actedAt = ledger.touchedAt;
-		const warms = mode === "warm" || mode === "warmcomp";
-		const limit = limitOf(settings);
-		const last = ledger.last!;
-		if (warms && replayable().ok) {
-			if (limit === undefined) await ensurePrices();
-			const left = keepalivesLeft(ledger, price?.value, limit, effectiveTtl() === "1h");
-			if (left !== null && left > 0) {
-				notes.delete("upkeep");
-				return sendKeepalive(c);
+		// Claim this epoch before asynchronous pricing; no second tick may claim it.
+		const touch = ledger.touchedAt;
+		const runRevision = revision;
+		const plannedMode = mode;
+		const plan = {};
+		upkeepPlan = plan;
+		actedAt = touch;
+		try {
+			const warms = mode === "warm" || mode === "warmcomp";
+			const limit = limitOf(settings);
+			if (warms && replayable().ok && limit === undefined) await ensurePrices();
+			// Pricing may take seconds: the user, model, branch, or cache can change while waiting.
+			if (upkeepPlan !== plan || runRevision !== revision || !ctx || mode !== plannedMode || busy || compacting || !idle() ||
+				ledger.touchedAt !== touch || cacheStatus(ledger, now()).state !== "warm") return;
+			const last = ledger.last!;
+			if (!ctx.model || `${ctx.model.provider}/${ctx.model.id}` !== last.model) return;
+			if (warms && replayable().ok) {
+				const left = keepalivesLeft(ledger, price?.value, limit, effectiveTtl() === "1h");
+				if (left !== null && left > 0) {
+					notes.delete("upkeep");
+					await sendKeepalive(c);
+					return;
+				}
 			}
-		}
-		if (mode !== "warm" && last.read + last.write + last.fresh >= thresholdOf(settings)) return compact(c);
-		if (warms) {
-			notes.set(
-				"upkeep",
-				!replayable().ok
-					? `warming skipped: ${replayable().reason}`
-					: limit !== undefined
-						? `warming stopped at the keepalive limit of ${limit}`
-						: price?.value
-							? "warming paused: another keepalive would cost more than rewriting the cache"
-							: "warming off: no price found for this model (set a numeric keepalive limit to warm anyway)",
-			);
+			if (mode !== "warm" && last.read + last.write + last.fresh >= thresholdOf(settings)) return compact(c);
+			if (warms) notes.set("upkeep", !replayable().ok
+				? `warming skipped: ${replayable().reason}`
+				: limit !== undefined ? `warming stopped at the keepalive limit of ${limit}`
+				: price?.value ? "warming paused: another keepalive would cost more than rewriting the cache"
+				: "warming off: no price found for this model (set a numeric keepalive limit to warm anyway)");
+		} finally {
+			if (upkeepPlan === plan) upkeepPlan = undefined;
 		}
 	}
 
@@ -402,7 +456,8 @@ export default function keepalive(pi: ExtensionAPI) {
 		const parts = [`${warming} (settings.json cacheWarming)`];
 		if (warming !== "off" && !model?.promptCache) parts.push("inactive: model declares no promptCache lifetime");
 		if (warming === "idle" && mode !== "off") parts.push("idle refreshes left to keepalive");
-		if (effectiveTtl() === "1h" && ttlSupported()) parts.push("refreshes skipped on a 1h cache");
+		if (ttlSupported() && effectiveTtl() !== (process.env.PI_CACHE_RETENTION === "long" ? "1h" : "5m"))
+			parts.push("refreshes skipped: native schedule does not match the selected TTL");
 		return parts.join(" · ");
 	}
 
@@ -415,16 +470,12 @@ export default function keepalive(pi: ExtensionAPI) {
 			if (s.kind !== "keepalive") continue;
 			count++;
 			const [provider, ...rest] = s.model.split("/");
-			const cost: any = ctx?.modelRegistry.find(provider, rest.join("/"))?.cost;
-			if (!cost?.input) {
-				priced = false;
-				continue;
-			}
-			const oneHour = s.creation?.oneHour ?? 0;
-			total += (s.read * cost.cacheRead + (s.write - oneHour) * cost.cacheWrite + oneHour * 2 * cost.input + s.fresh * cost.input + s.output * cost.output) / 1e6;
+			const cost = sampleCost(ctx?.modelRegistry.find(provider, rest.join("/")), s);
+			if (cost === null) priced = false;
+			else total += cost;
 		}
 		if (!count) return undefined;
-		return `${count} keepalive${count === 1 ? "" : "s"} this session · $${total.toFixed(4)}${priced ? "" : " (some unpriced)"}`;
+		return `${count} keepalive${count === 1 ? "" : "s"} this session · ${priced ? `$${total.toFixed(4)} estimated` : `$${total.toFixed(4)} known spend (some unpriced)`}`;
 	}
 
 	function view(): View {
@@ -446,7 +497,7 @@ export default function keepalive(pi: ExtensionAPI) {
 			model: ctx?.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 			ledger,
 			status,
-			mode: isChild ? null : mode,
+			mode,
 			ttl: { value: effectiveTtl(), source: ttlChoice ? "chosen for this session" : def.source, chosen: !!ttlChoice, supported: ttlSupported() },
 			left,
 			compactable: !!last && last.read + last.write + last.fresh >= thresholdOf(settings),
@@ -471,7 +522,7 @@ export default function keepalive(pi: ExtensionAPI) {
 	// -------------------------------------------------------------- actions
 
 	function cycleMode() {
-		if (isChild) return;
+		cancelReplay(false);
 		mode = UPKEEP_MODES[(UPKEEP_MODES.indexOf(mode) + 1) % UPKEEP_MODES.length];
 		actedAt = undefined;
 		notes.delete("upkeep");
@@ -480,6 +531,7 @@ export default function keepalive(pi: ExtensionAPI) {
 	}
 
 	function setTtl(value: Ttl | undefined) {
+		cancelReplay(false);
 		ttlChoice = value;
 		persistState();
 		redraw();
@@ -558,7 +610,7 @@ export default function keepalive(pi: ExtensionAPI) {
 		timer = setInterval(() => {
 			const t = now();
 			// Forget requests whose completion was never observed (e.g. aborted outside the agent loop).
-			pending = pending.filter((p) => !p.done && t - p.startedAt < PENDING_STALE_MS);
+			pending = pending.filter((p) => !p.done && ((p.kind === "real" && agentRunning) || t - p.startedAt < PENDING_STALE_MS));
 			void upkeep().catch(() => {});
 			const second = Math.floor(t / 1000);
 			if (second !== lastSecond) {
@@ -592,6 +644,10 @@ export default function keepalive(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", () => {
 		stopTimer();
+		cancelReplay();
+		sessionRevision++;
+		busy = undefined;
+		pending = [];
 		widgetTui = undefined;
 		dashboardTui = undefined;
 		ctx = undefined;
@@ -599,13 +655,15 @@ export default function keepalive(pi: ExtensionAPI) {
 
 	pi.on("model_select", (_event, c) => {
 		ctx = c;
+		cancelReplay();
+		price = undefined;
 		redraw();
 	});
 
 	pi.on("thinking_level_select", (_event, c) => {
 		ctx = c;
 		// The thinking parameters are part of the cache key; the captured request no longer matches the next one.
-		snapshot = undefined;
+		cancelReplay();
 		redraw();
 	});
 
@@ -613,7 +671,7 @@ export default function keepalive(pi: ExtensionAPI) {
 		ctx = c;
 		agentRunning = true;
 		// A real turn supersedes a keepalive still in flight; it becomes the new cache anchor.
-		keepaliveAbort?.abort();
+		cancelReplay();
 	});
 
 	pi.on("agent_settled", (_event, c) => {
@@ -630,17 +688,20 @@ export default function keepalive(pi: ExtensionAPI) {
 		const model: any = c.model;
 		const anthropic = isAnthropicPayload(payload);
 		// pi's own cache warmer replays the last request with a one-token cap; idle replays happen outside a run.
-		const kind: PendingRequest["kind"] = !agentRunning || (anthropic && payload.max_tokens === 1) ? "pi-warmer" : "real";
+		const kind: PendingRequest["kind"] = !agentRunning || (nativeRefresh && anthropic && payload.max_tokens === 1) ? "pi-warmer" : "real";
+		nativeRefresh = false;
 		let requested: Ttl | undefined;
 		if (anthropic) {
 			if (ttlSupported(model) && payloadTtl(payload)) setPayloadTtl(payload, effectiveTtl());
 			requested = payloadTtl(payload);
 		}
-		const modelId = anthropic && typeof payload.model === "string" ? payload.model : model?.id;
+		// Use the registry id, not a gateway's wire alias, when looking the model up later.
+		const modelId = model?.id ?? "unknown";
 		const provider = model?.provider ?? "unknown";
+		const startedAt = now();
 		pending.push({
 			kind,
-			startedAt: now(),
+			startedAt,
 			model: `${provider}/${modelId}`,
 			api: model?.api ?? "unknown",
 			requested,
@@ -649,11 +710,12 @@ export default function keepalive(pi: ExtensionAPI) {
 		if (kind === "real") {
 			if (anthropic) {
 				try {
-					snapshot = { payload: structuredClone(payload), provider, modelId, api: model?.api, capturedAt: now() };
+					snapshot = { payload: structuredClone(payload), provider, modelId, api: model?.api, capturedAt: startedAt, confirmed: false };
 				} catch {
 					snapshot = undefined;
 				}
-			} else snapshot = { payload: undefined, provider, modelId, api: model?.api ?? "unknown", capturedAt: now() };
+			} else snapshot = { payload: undefined, provider, modelId, api: model?.api ?? "unknown", capturedAt: startedAt, confirmed: false };
+			pending.at(-1)!.snapshot = snapshot;
 			actedAt = undefined;
 			notes.delete("upkeep");
 		}
@@ -664,14 +726,15 @@ export default function keepalive(pi: ExtensionAPI) {
 	pi.on("provider_stream_event", (event) => {
 		const data: any = event.data;
 		if (!data || typeof data !== "object") return;
+		const matches = (p: PendingRequest) => p.api === event.api && p.model === `${event.provider}/${event.model}`;
 		if (data.type === "message_start") {
-			// Requests are sequential; the newest unanswered one is the one that just started streaming.
-			const rec = [...pending].reverse().find((p) => !p.started && !p.done);
+			// Ignore side-channel streams from a different model or provider.
+			const rec = [...pending].reverse().find((p) => matches(p) && !p.started && !p.done);
 			if (!rec) return;
 			rec.started = true;
 			rec.startUsage = data.message?.usage;
 		} else if (data.type === "message_delta" && data.usage) {
-			const rec = [...pending].reverse().find((p) => p.started && !p.done);
+			const rec = [...pending].reverse().find((p) => matches(p) && p.started && !p.done);
 			if (!rec) return;
 			rec.deltaUsage = data.usage;
 			if (rec.kind === "pi-warmer") {
@@ -700,7 +763,8 @@ export default function keepalive(pi: ExtensionAPI) {
 		const message: any = event.message;
 		if (message?.role !== "assistant") return;
 		const reals = pendingReal();
-		const rec = reals.at(-1);
+		const rec = reals.findLast((p) => p.model === `${message.provider}/${message.model}`);
+		if (!rec) return; // Ignore assistants from side-channel calls without a captured main request.
 		for (const p of reals) p.done = true;
 		pending = pending.filter((p) => !p.done);
 		const usage = message.usage;
@@ -709,10 +773,11 @@ export default function keepalive(pi: ExtensionAPI) {
 		const write = usage.cacheWrite ?? 0;
 		const fresh = usage.input ?? 0;
 		const output = usage.output ?? 0;
-		if (read + write + fresh + output === 0) {
+		if ([read, write, fresh, output].some((v) => !Number.isSafeInteger(v) || v < 0) || read + write + fresh + output === 0) {
 			redraw();
 			return;
 		}
+		if (snapshot && rec.snapshot === snapshot && read + write > 0) snapshot.confirmed = true;
 		const raw = rec?.deltaUsage?.cache_creation ? rec.deltaUsage : rec?.startUsage;
 		const creation = raw ? reportedCreation({ ...raw, cache_creation_input_tokens: write }) : undefined;
 		record({
@@ -733,6 +798,8 @@ export default function keepalive(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_before_compact", () => {
+		cancelReplay();
+		compacting = true;
 		compactStartedAt ??= now();
 	});
 
@@ -761,19 +828,24 @@ export default function keepalive(pi: ExtensionAPI) {
 			...(after !== undefined ? { tokensAfter: Math.round(after) } : {}),
 		});
 		compactStartedAt = undefined;
-		snapshot = undefined;
+		compacting = false;
+		cancelReplay();
 	});
 
 	pi.on("session_compact_failed", () => {
 		compactStartedAt = undefined;
+		compacting = false;
+		busy = undefined;
 	});
 
 	pi.on("cache_warming_decision", (event) => {
-		if (isChild) return undefined;
+		nativeRefresh = false;
 		// Idle refreshes belong to the upkeep mode when one is active.
 		if (!agentRunning && mode !== "off") return { action: "stop" };
-		// pi assumes the short lifetime unless PI_CACHE_RETENTION=long; a 1h entry needs no 4.5-minute refreshes.
-		if (effectiveTtl() === "1h" && ttlSupported() && process.env.PI_CACHE_RETENTION !== "long") return { action: "stop" };
+		// The native schedule comes from PI_CACHE_RETENTION, not our rewritten payload.
+		// Either mismatch can cause needless refreshes or a full-price write after expiry.
+		if (ttlSupported() && effectiveTtl() !== (process.env.PI_CACHE_RETENTION === "long" ? "1h" : "5m")) return { action: "stop" };
+		nativeRefresh = event.action === "warm";
 		return undefined;
 	});
 
@@ -790,8 +862,8 @@ export default function keepalive(pi: ExtensionAPI) {
 			ctx = c;
 			const [verb, value] = (args ?? "").trim().split(/\s+/);
 			if (verb === "mode") {
-				if (isChild) return c.ui.notify("Keepalive: subagent sessions have no upkeep.", "warning");
 				if (!UPKEEP_MODES.includes(value as Upkeep)) return c.ui.notify(`Usage: /keepalive mode <${UPKEEP_MODES.join("|")}>`, "warning");
+				cancelReplay(false);
 				mode = value as Upkeep;
 				actedAt = undefined;
 				notes.delete("upkeep");
@@ -875,6 +947,7 @@ export default function keepalive(pi: ExtensionAPI) {
 					if (v) patch = { [key]: v === "on" } as any;
 				}
 				if (patch) {
+					cancelReplay(false);
 					const path = saveSettings(c.cwd, patch, trusted(c));
 					if (!path) c.ui.notify("Keepalive: settings.json could not be read or written; nothing saved.", "error");
 					settings = loadSettings(c.cwd, trusted(c));
