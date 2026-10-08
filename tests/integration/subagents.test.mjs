@@ -4,14 +4,14 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 const fixture = fileURLToPath(new URL('./runtime-fixture.mjs', import.meta.url));
-for (const mode of ['foreground', 'background']) {
-  test(`real pi-subagents ${mode} runtime`, { timeout: 75_000 }, async t => {
+for (const mode of ['foreground', 'background']) for (const api of ['anthropic-messages', 'openai-responses', 'openai-codex-responses']) {
+  test(`real pi-subagents ${mode} ${api} runtime`, { timeout: 75_000 }, async t => {
     // Never inherit credentials, NODE_OPTIONS, or the caller's agent directory.
     const env = { PATH: process.env.PATH };
     for (const key of ['PI_KEEPALIVE_PI_ROOT', 'PI_KEEPALIVE_SUBAGENTS_ROOT', 'SystemRoot']) {
       if (process.env[key]) env[key] = process.env[key];
     }
-    const run = spawnSync(process.execPath, [fixture, mode], { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 256 * 1024 });
+    const run = spawnSync(process.execPath, [fixture, mode, api], { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 256 * 1024 });
     assert.equal(run.error, undefined, run.error?.message);
     assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
     const line = run.stdout.split('\n').find(l => l.startsWith('KEEPALIVE_INTEGRATION_RESULT '));
@@ -19,6 +19,7 @@ for (const mode of ['foreground', 'background']) {
     const result = JSON.parse(line.slice('KEEPALIVE_INTEGRATION_RESULT '.length));
     await t.test('correct process role and native extension loading', () => {
       assert.equal(result.mode, mode);
+      assert.equal(result.api, api);
       assert.notEqual(result.pid, process.pid); // fixture isolation; foreground parent and children coexist inside it
       assert.equal(result.marker, mode === 'background' ? '1' : null);
     });
@@ -37,9 +38,13 @@ for (const mode of ['foreground', 'background']) {
     });
     await t.test('shutdown aborts in-flight provider traffic and prevents late ledger writes', () => {
       assert.equal(result.abortedOnShutdown, true);
+      if (api !== 'anthropic-messages') assert.equal(result.unknownShutdown, true);
     });
     await t.test('real SDK compaction happens once after the budget, then stops', () => {
       assert.equal(result.childCompactions, 1);
+    });
+    await t.test('compaction preserves every original saved chat message', () => {
+      assert.equal(result.historyPreserved, true);
     });
   });
 }

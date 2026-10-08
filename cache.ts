@@ -5,7 +5,7 @@
  * conversation a pi session owns: the main loop.
  */
 
-export type Ttl = "5m" | "1h";
+export type Ttl = "5m" | "30m" | "1h";
 export type SampleKind = "real" | "keepalive" | "compaction";
 export type Grade = "good" | "fair" | "poor";
 export type Upkeep = "off" | "warm" | "compact" | "warmcomp";
@@ -31,12 +31,14 @@ export interface Sample {
 	output: number;
 	/** 5m/1h write breakdown reported by the response (Anthropic `usage.cache_creation`). */
 	creation?: CacheCreation;
-	/** TTL the request asked for (Anthropic cache_control). */
+	/** TTL requested or fixed by the provider policy. */
 	requested?: Ttl;
 	/** Lifetime the model declares in models.json `promptCache` for the tier the request used. */
 	declaredTtlMs?: number;
 	/** Who sent a keepalive: this extension or pi's built-in cache warmer. */
 	via?: "keepalive" | "pi-warmer";
+	/** A dispatched probe ended without usable billing data; do not assume it was free. */
+	usageUnknown?: boolean;
 	tokensBefore?: number;
 	tokensAfter?: number;
 	/** Computed, never persisted. */
@@ -95,7 +97,7 @@ export const RATE_REQUESTS = 10;
 export const MISS_WINDOW_MS = 900_000;
 export const MISS_FRESH_MS = 300_000;
 export const TTL_REPORT_MS = 30_000;
-export const TTL_MS: Record<Ttl, number> = { "5m": 300_000, "1h": 3_600_000 };
+export const TTL_MS: Record<Ttl, number> = { "5m": 300_000, "30m": 1_800_000, "1h": 3_600_000 };
 
 const count = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
 
@@ -109,7 +111,8 @@ export function validSample(s: any): s is Sample {
 		typeof s.model === "string" &&
 		["startedAt", "read", "write", "fresh", "output"].every((k) => count(s[k])) &&
 		(s.completedAt === undefined || count(s.completedAt)) &&
-		(s.requested === undefined || s.requested === "5m" || s.requested === "1h") &&
+		(s.requested === undefined || s.requested === "5m" || s.requested === "30m" || s.requested === "1h") &&
+		(s.usageUnknown === undefined || (s.kind === "keepalive" && typeof s.usageUnknown === "boolean")) &&
 		(s.declaredTtlMs === undefined || (count(s.declaredTtlMs) && s.declaredTtlMs > 0)) &&
 		(s.tokensBefore === undefined || count(s.tokensBefore)) &&
 		(s.tokensAfter === undefined || count(s.tokensAfter)) &&
@@ -259,8 +262,9 @@ export function cacheStatus(ledger: Ledger | undefined, now: number, pendingAt?:
 	];
 	// A declared lifetime that is not 5m or 1h (e.g. a provider's 10-minute cache).
 	const declared = ledger.declaredTtlMs ?? sample.declaredTtlMs;
-	if (resolved.basis === "declared" && declared && declared !== TTL_MS["5m"] && declared !== TTL_MS["1h"]) {
-		parts.splice(0, 2, { ttl: "5m", ttlMs: declared, tokens: Math.max(1, sample.read + sample.write) });
+	const custom = resolved.basis === "declared" ? declared : resolved.basis === "awaiting" && sample.requested === "30m" ? TTL_MS["30m"] : undefined;
+	if (custom && custom !== TTL_MS["5m"] && custom !== TTL_MS["1h"]) {
+		parts.splice(0, 2, { ttl: custom === TTL_MS["30m"] ? "30m" : "5m", ttlMs: custom, tokens: Math.max(1, sample.read + sample.write) });
 	}
 	const lifetimes = parts
 		.filter((p) => p.tokens > 0)
@@ -324,19 +328,22 @@ export function keepalivesLeft(
 	prices: Prices | null | undefined,
 	limit?: number,
 	oneHour = false,
+	/** Extra predicted cost in input-price units (OpenAI suffix and output reserve). */
+	overhead = 0,
 ): number | null {
 	const last = ledger?.last;
 	const prefix = last ? last.read + last.write : 0;
 	if (!ledger || !last || !prefix) return null;
 	if (limit !== undefined) return limit === Infinity ? Infinity : count(limit) ? Math.max(0, limit - ledger.keepalives.length) : 0;
-	if (!validPrices(prices)) return 0;
+	if (!validPrices(prices) || ledger.keepalives.some(s => s.usageUnknown) || !multiple(overhead)) return 0;
 	const write = writePrice(prices, oneHour || (!!ledger.creation?.oneHour && !ledger.creation.fiveMinute));
 	const cost = (s: Sample) => {
 		const hourTokens = s.creation?.oneHour ?? (s.requested === "1h" ? s.write : 0);
 		return s.read * prices.read + (s.write - hourTokens) * writePrice(prices, false) + hourTokens * writePrice(prices, true) + s.fresh + s.output * prices.output;
 	};
 	const spent = ledger.keepalives.reduce((sum, s) => sum + cost(s), 0);
-	const next = ledger.keepalives.length ? cost(ledger.keepalives.at(-1)!) : prefix * prices.read + prices.output;
+	const minimum = prefix * prices.read + prices.output + overhead;
+	const next = ledger.keepalives.length ? Math.max(cost(ledger.keepalives.at(-1)!), overhead ? minimum : 0) : minimum;
 	if (next <= 0) return null;
 	return Math.max(0, Math.floor((prefix * (write - prices.read) - spent) / next + 1e-9));
 }

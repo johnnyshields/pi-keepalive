@@ -181,6 +181,7 @@ export function registryPrices(model: any, contextTokens = 0): Prices | null {
 
 /** Estimated USD using the same context tier as pi. Missing prices are unknown, not zero. */
 export function sampleCost(model: any, sample: Sample): number | null {
+	if (sample.usageUnknown) return null;
 	const selected = registryRates(model, sample.read + sample.write + sample.fresh);
 	if (!selected || (sample.write > 0 && !price(selected.rates.cacheWrite))) return null;
 	const { rates } = selected;

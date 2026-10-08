@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { zstdDecompressSync, gunzipSync } from 'node:zlib';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -10,6 +11,12 @@ import { createRequire, registerHooks } from 'node:module';
 
 const mode = process.argv[2];
 assert.ok(['foreground', 'background'].includes(mode));
+const api = process.argv[3] ?? 'anthropic-messages';
+assert.ok(['anthropic-messages', 'openai-responses', 'openai-codex-responses'].includes(api));
+const openai = api !== 'anthropic-messages';
+const modelId = openai ? 'gpt-6-sol' : 'claude-sonnet-4-5';
+const childTTL = openai ? '30m' : '1h';
+const leadMs = openai ? 1_770_000 : 3_570_000;
 const repo = fileURLToPath(new URL('../../', import.meta.url));
 const require = createRequire(import.meta.url);
 function packageRoot(name, override, specifier) {
@@ -64,31 +71,42 @@ function controls(payload) {
     ...payload.messages.flatMap(m => Array.isArray(m.content) ? m.content.map(b => b.cache_control) : [])].filter(Boolean);
 }
 function label(payload) {
-  const user = payload.messages.findLast(m => m.role === 'user');
+  const user = (payload.messages ?? payload.input).findLast(m => m.role === 'user' && !JSON.stringify(m).includes('Cache maintenance only.'));
   const text = typeof user?.content === 'string' ? user.content : (user?.content ?? []).map(b => b.text ?? '').join(' ');
   return text.match(/PARENT|CHILD-A|CHILD-B/)?.[0] ?? 'unknown';
 }
 function prefix(payload) {
   const copy = structuredClone(payload);
   delete copy.max_tokens;
+  delete copy.max_output_tokens;
+  if (openai && JSON.stringify(copy.input.at(-1)).includes('Cache maintenance only.')) copy.input.pop();
   return JSON.stringify(copy);
 }
 const server = createServer(async (req, res) => {
   try {
     assert.equal(req.method, 'POST');
-    assert.match(new URL(req.url, 'http://fixture.invalid').pathname, /\/messages$/);
-    let text = '';
-    for await (const chunk of req) text += chunk;
-    const body = JSON.parse(text);
+    assert.match(new URL(req.url, 'http://fixture.invalid').pathname, /\/(messages|responses)$/);
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const bytes = Buffer.concat(chunks);
+    const decoded = req.headers['content-encoding'] === 'zstd' ? zstdDecompressSync(bytes) :
+      req.headers['content-encoding'] === 'gzip' ? gunzipSync(bytes) : bytes;
+    const body = JSON.parse(decoded.toString('utf8'));
     const key = prefix(body);
-    const markers = controls(body);
-    const ttl = markers.length && markers.every(c => c.ttl === '1h') ? '1h' : '5m';
-    const warm = body.max_tokens === 1;
+    const markers = openai ? [] : controls(body);
+    const ttl = openai ? '30m' : markers.length && markers.every(c => c.ttl === '1h') ? '1h' : '5m';
+    const warm = openai ? JSON.stringify(body.input.at(-1)).includes('Cache maintenance only.') : body.max_tokens === 1;
+    if (api === 'openai-codex-responses') {
+      assert.equal(body.max_output_tokens, undefined);
+      assert.equal(body.prompt_cache_retention, undefined);
+      assert.equal(body.prompt_cache_options, undefined);
+    }
+    if (warm && api === 'openai-responses') assert.equal(body.max_output_tokens, 16);
     const hit = cache.has(key) && clock < cache.get(key);
     if (warm) assert.ok(hit, 'a keepalive must replay a warm, byte-identical prefix');
     const call = { label: label(body), ttl, warm, hit, at: clock };
     calls.push(call);
-    cache.set(key, clock + (ttl === '1h' ? 3_600_000 : 300_000));
+    cache.set(key, clock + (openai ? 1_800_000 : ttl === '1h' ? 3_600_000 : 300_000));
     const tokens = 10_000;
     const usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: hit ? tokens : 0,
       cache_creation_input_tokens: hit ? 0 : tokens,
@@ -96,7 +114,7 @@ const server = createServer(async (req, res) => {
         ephemeral_1h_input_tokens: !hit && ttl === '1h' ? tokens : 0 } };
     const message = { id: `msg_fixture_${++requestId}`, type: 'message', role: 'assistant', model: body.model,
       content: [], stop_reason: null, stop_sequence: null, usage };
-    const events = [
+    let events = [
       { type: 'message_start', message },
       { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
       { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'OK' } },
@@ -104,6 +122,24 @@ const server = createServer(async (req, res) => {
       { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 1 } },
       { type: 'message_stop' },
     ];
+    if (openai) {
+      const item = { id: `msg_${requestId}`, type: 'message', role: 'assistant', status: 'completed',
+        content: [{ type: 'output_text', text: 'OK', annotations: [] }] };
+      const response = { id: `resp_${requestId}`, object: 'response', created_at: Math.floor(clock / 1000), model: body.model,
+        status: 'completed', output: [item], usage: { input_tokens: tokens + (warm ? 20 : 0), output_tokens: 1,
+          total_tokens: tokens + (warm ? 20 : 0) + 1,
+          input_tokens_details: { cached_tokens: hit ? tokens : 0, cache_write_tokens: hit ? (warm ? 20 : 0) : tokens },
+          output_tokens_details: { reasoning_tokens: 0 } } };
+      events = [
+        { type: 'response.created', response: { ...response, status: 'in_progress', output: [], usage: null } },
+        { type: 'response.output_item.added', output_index: 0, item: { ...item, status: 'in_progress', content: [] } },
+        { type: 'response.content_part.added', output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } },
+        { type: 'response.output_text.delta', item_id: item.id, output_index: 0, content_index: 0, delta: 'OK' },
+        { type: 'response.output_text.done', item_id: item.id, output_index: 0, content_index: 0, text: 'OK' },
+        { type: 'response.output_item.done', output_index: 0, item },
+        { type: 'response.completed', response },
+      ].map((e, sequence_number) => ({ ...e, sequence_number }));
+    }
     const respond = () => {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       res.end(events.map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(''));
@@ -117,6 +153,8 @@ const server = createServer(async (req, res) => {
     res.writeHead(500); res.end('fixture assertion failed');
   }
 });
+// SDK compaction may use auto transport; this fixture supports SSE only.
+server.on('upgrade', (_req, socket) => socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'));
 await new Promise(r => server.listen(0, '127.0.0.1', r));
 const origin = `http://127.0.0.1:${server.address().port}`;
 const originalFetch = globalThis.fetch;
@@ -126,13 +164,16 @@ globalThis.fetch = (input, options) => {
   return originalFetch(input, options);
 };
 
-const provider = { baseUrl: origin, api: 'anthropic-messages', apiKey: 'TEST_ONLY_NOT_A_REAL_KEY',
-  models: [{ id: 'claude-sonnet-4-5', name: 'Local fixture', reasoning: false, input: ['text'],
-    contextWindow: 200_000, maxTokens: 4096, promptCache: { short: 300, long: 3600 },
+// Unsigned, loopback-only fixture JWT; no real account or credential is used.
+const fakeJwt = 'e30.' + Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'test-account' } })).toString('base64url') + '.TEST_ONLY';
+const provider = { baseUrl: origin, api, apiKey: api === 'openai-codex-responses' ? fakeJwt : 'TEST_ONLY_NOT_A_REAL_KEY',
+  models: [{ id: modelId, name: 'Local fixture', reasoning: false, input: ['text'],
+    ...(api === 'openai-responses' ? { compat: { supportsExplicitPromptCacheMode: true, supportsLongCacheRetention: true } } : {}),
+    contextWindow: 200_000, maxTokens: 4096, promptCache: openai ? { short: 1800, long: 1800 } : { short: 300, long: 3600 },
     cost: { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 } }] };
 writeFileSync(join(root, 'models.json'), JSON.stringify({ providers: { 'keepalive-test': provider } }));
 writeFileSync(join(root, 'settings.json'), JSON.stringify({
-  defaultProvider: 'keepalive-test', defaultModel: 'claude-sonnet-4-5', cacheWarming: 'off',
+  defaultProvider: 'keepalive-test', defaultModel: modelId, cacheWarming: 'off', transport: 'sse',
   retry: { enabled: false }, compaction: { enabled: false },
   keepalive: { cache_ttl: '5m', subagent_cache_ttl: '1h', cache_upkeep: 'warmcomp', keepalive_limit: '1',
     compact_threshold: '100k', models_dev: false, show_bar: false },
@@ -140,13 +181,14 @@ writeFileSync(join(root, 'settings.json'), JSON.stringify({
 if (mode === 'background') {
   const installed = join(root, 'extensions', 'keepalive');
   mkdirSync(installed, { recursive: true });
-  for (const name of ['index.ts', 'child.ts', 'cache.ts', 'prices.ts', 'settings.ts', 'ui.ts', 'package.json']) cpSync(join(repo, name), join(installed, name));
+  for (const name of ['index.ts', 'child.ts', 'cache.ts', 'prices.ts', 'settings.ts', 'ui.ts', 'openai.ts', 'package.json']) cpSync(join(repo, name), join(installed, name));
 }
 let factory, parent, a, b, c;
 const extensionErrors = [];
-const sampleEntries = child => readFileSync(child.sessionFile, 'utf8').trim().split('\n').map(l => JSON.parse(l))
-  .filter(e => e.type === 'custom' && e.customType === 'keepalive-sample').map(e => e.data);
-const ownSamples = child => sampleEntries(child).filter(e => e.ownerSession === child.sessionId);
+const entries = child => readFileSync(child.sessionFile, 'utf8').trim().split('\n').map(l => JSON.parse(l));
+const sampleEntries = child => [...new Map(entries(child).filter(e => e.type === 'custom' && e.customType === 'keepalive-sample')
+  .map(e => [`${e.data.ownerSession}:${e.data.id}`, e.data])).values()];
+const ownSamples = child => sampleEntries(child).filter(e => e.ownerSession === child.sessionId && !e.usageUnknown);
 const warms = name => calls.filter(c => c.label === name && c.warm);
 async function waitFor(condition, description) {
   const deadline = originalNow() + 6000;
@@ -179,46 +221,46 @@ try {
     await loader.reload();
     assert.deepEqual(loader.getExtensions().errors, []);
     ({ session: parent } = await pi.createAgentSession({ cwd, agentDir: root, modelRuntime: parentRuntime,
-      model: parentRuntime.getModel('keepalive-test', 'claude-sonnet-4-5'), thinkingLevel: 'off',
+      model: parentRuntime.getModel('keepalive-test', modelId), thinkingLevel: 'off',
       tools: [], resourceLoader: loader, settingsManager: settings, sessionManager: store }));
     await parent.bindExtensions({ mode: 'print', onError: e => extensionErrors.push(String(e.error)) });
     await parent.prompt('PARENT');
     const reply = parent.messages.findLast(m => m.role === 'assistant');
     assert.equal(reply?.stopReason, 'stop', [...errors, reply?.errorMessage].filter(Boolean).join('\n'));
-    assert.equal(calls.at(-1)?.ttl, '5m');
+    assert.equal(calls.at(-1)?.ttl, openai ? '30m' : '5m');
     seed = store;
   } else {
     seed = pi.SessionManager.inMemory(cwd);
     seed.appendMessage({ role: 'user', content: 'PARENT', timestamp: clock });
     seed.appendCustomEntry('keepalive-state', { mode: 'off', ttl: '5m', ownerSession: seed.getSessionId() });
     seed.appendCustomEntry('keepalive-sample', { id: 'parent-observation', kind: 'real', ownerSession: seed.getSessionId(),
-      model: 'keepalive-test/claude-sonnet-4-5', startedAt: clock, read: 0, write: 10_000, fresh: 0, output: 1,
+      model: `keepalive-test/${modelId}`, startedAt: clock, read: 0, write: 10_000, fresh: 0, output: 1,
       creation: { fiveMinute: 10_000, oneHour: 0 }, requested: '5m' });
   }
   const launch = name => ({ cwd, projectTrusted: false, storage: { kind: 'file', sessionFile: forkFile(seed, name) },
-    ...(parentRuntime ? { parentProviderRegistry: parentRuntime } : {}), model: 'keepalive-test/claude-sonnet-4-5:off', tools: [],
+    ...(parentRuntime ? { parentProviderRegistry: parentRuntime } : {}), model: `keepalive-test/${modelId}:off`, tools: [],
     extensionPaths: mode === 'foreground' ? [join(repo, 'child.ts')] : [], ambientExtensions: mode === 'background',
-    hooks: [], noSkills: true, noContextFiles: true, runtime: {},
+    hooks: [], noSkills: true, noContextFiles: true, runtime: { transport: 'sse' },
     onExtensionError: e => extensionErrors.push(`${e.event}: ${e.error}`) });
   a = await factory.create(launch('a'));
   b = await factory.create(launch('b'));
   assert.notEqual(a.sessionId, b.sessionId);
   assert.equal(process.env.PI_SUBAGENT_CHILD, mode === 'background' ? '1' : undefined);
   await Promise.all([a.prompt('CHILD-A'), b.prompt('CHILD-B')]);
-  assert.ok(calls.filter(c => c.label.startsWith('CHILD') && !c.warm).every(c => c.ttl === '1h'));
+  assert.ok(calls.filter(c => c.label.startsWith('CHILD') && !c.warm).every(c => c.ttl === childTTL));
   assert.ok(sampleEntries(a).some(e => e.ownerSession === seed.getSessionId())); // real forked parent history
-  clock += 3_570_000;
+  clock += leadMs;
   await waitFor(() => ownSamples(a).filter(e => e.kind === 'keepalive').length === 1 &&
     ownSamples(b).filter(e => e.kind === 'keepalive').length === 1, 'both children warming with independent ledgers');
   assert.equal(warms('PARENT').length, 0);
-  assert.ok([...warms('CHILD-A'), ...warms('CHILD-B')].every(c => c.ttl === '1h' && c.hit));
+  assert.ok([...warms('CHILD-A'), ...warms('CHILD-B')].every(c => c.ttl === childTTL && c.hit));
   assert.equal(a.messages.filter(m => m.role === 'user').length, 2); // parent + child, no synthetic warm turn
-  clock += 3_570_000;
+  clock += leadMs;
   await new Promise(r => setTimeout(r, 1200)); // allow at least one real scheduler tick at the exhausted budget
   assert.equal(warms('CHILD-A').length, 1);
   assert.equal(warms('CHILD-B').length, 1);
   await a.prompt('CHILD-A next real turn');
-  clock += 3_570_000;
+  clock += leadMs;
   await waitFor(() => ownSamples(a).filter(e => e.kind === 'keepalive').length === 2, 'only A resets its budget');
   assert.equal(warms('CHILD-B').length, 1);
   const aFile = a.sessionFile;
@@ -226,7 +268,7 @@ try {
   await a.dispose();
   await b.prompt('CHILD-B next real turn');
   holdWarm = true;
-  clock += 3_570_000;
+  clock += leadMs;
   await waitFor(() => held.length === 1, 'B warm request held in flight');
   const before = ownSamples(b).filter(e => e.kind === 'keepalive').length;
   await b.dispose();
@@ -243,29 +285,33 @@ try {
   configured.keepalive.compact_threshold = '1k';
   writeFileSync(settingsPath, JSON.stringify(configured));
   seed.appendMessage({ role: 'user', content: 'Old context ' + 'historical data '.repeat(4000), timestamp: clock });
-  seed.appendMessage({ role: 'assistant', content: [{ type: 'text', text: 'Old reply' }], api: 'anthropic-messages',
-    provider: 'keepalive-test', model: 'claude-sonnet-4-5', stopReason: 'stop', timestamp: clock,
+  seed.appendMessage({ role: 'assistant', content: [{ type: 'text', text: 'Old reply' }], api,
+    provider: 'keepalive-test', model: modelId, stopReason: 'stop', timestamp: clock,
     usage: { input: 0, output: 1, cacheRead: 0, cacheWrite: 10_000, totalTokens: 10_001,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
   c = await factory.create(launch('c'));
   await c.prompt('CHILD-C compaction check');
-  assert.ok(ownSamples(c).filter(e => e.kind === 'real').every(e => e.requested === '1h'));
-  clock += 3_570_000;
+  assert.ok(ownSamples(c).filter(e => e.kind === 'real').every(e => e.requested === childTTL));
+  const originalMessages = entries(c).filter(e => e.type === 'message');
+  clock += leadMs;
   await waitFor(() => ownSamples(c).some(e => e.kind === 'compaction'), 'real child compaction after its zero keepalive budget');
   const compactions = ownSamples(c).filter(e => e.kind === 'compaction').length;
-  clock += 3_570_000;
+  const after = new Map(entries(c).filter(e => e.type === 'message').map(e => [e.id, e]));
+  for (const original of originalMessages) assert.deepEqual(after.get(original.id), original, 'compaction must preserve every original transcript entry');
+  clock += leadMs;
   await new Promise(r => setTimeout(r, 1200));
   assert.equal(ownSamples(c).filter(e => e.kind === 'compaction').length, compactions);
   assert.equal(compactions, 1);
   await c.dispose();
   assert.deepEqual(errors, []);
   assert.deepEqual(extensionErrors, []);
-  console.log('KEEPALIVE_INTEGRATION_RESULT ' + JSON.stringify({ mode, pid: process.pid, marker: process.env.PI_SUBAGENT_CHILD ?? null,
+  console.log('KEEPALIVE_INTEGRATION_RESULT ' + JSON.stringify({ mode, api, pid: process.pid, marker: process.env.PI_SUBAGENT_CHILD ?? null,
     distinctSessions: a.sessionId !== b.sessionId, childAReal: ownSamples(a).filter(e => e.kind === 'real').length,
     childAWarm: ownSamples(a).filter(e => e.kind === 'keepalive').length, childBWarm: before,
     parentWarm: warms('PARENT').length, prefixHits: calls.filter(c => c.warm).every(c => c.hit),
-    childTTL: calls.filter(c => c.label.startsWith('CHILD')).every(c => c.ttl === '1h'), abortedOnShutdown: closedWarm > 0,
-    childCompactions: compactions }));
+    childTTL: calls.filter(c => c.label.startsWith('CHILD')).every(c => c.ttl === childTTL), abortedOnShutdown: closedWarm > 0,
+    unknownShutdown: sampleEntries(b).some(e => e.ownerSession === b.sessionId && e.usageUnknown),
+    historyPreserved: originalMessages.every(e => after.has(e.id)), childCompactions: compactions }));
 } finally {
   try {
     await factory?.dispose();

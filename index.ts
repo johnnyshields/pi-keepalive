@@ -2,7 +2,7 @@
  * keepalive — prompt-cache controller for pi.
  *
  * Shows how long the conversation's prompt cache has left, lets you pick the
- * cache TTL sent to Anthropic (5m / 1h) per session, and keeps an idle cache
+ * Anthropic TTL (5m / 1h), uses a fixed 30m horizon for OpenAI GPT-5.6+, and keeps an idle cache
  * from expiring with one of four upkeep modes:
  *
  *   off      nothing is sent (provider default behaviour)
@@ -30,6 +30,7 @@ import {
 	validSample,
 } from "./cache.ts";
 import { lookUpPrices, sampleCost } from "./prices.ts";
+import { openAi30m, openAiCaching, openAiOutputReserve, openAiReplay, openAiReplayReason, openAiUsage, OPENAI_TTL_MS } from "./openai.ts";
 import { dataDir, DEFAULTS, type KeepaliveSettings, limitOf, loadSettings, saveSettings, thresholdOf } from "./settings.ts";
 import { type BarSegment, Dashboard, GUIDE, renderBar, type RequestFilter, type View } from "./ui.ts";
 
@@ -60,6 +61,7 @@ interface PendingRequest {
 	done?: boolean;
 	startUsage?: any;
 	deltaUsage?: any;
+	responseUsage?: ReturnType<typeof openAiUsage>;
 	snapshot?: Snapshot;
 }
 
@@ -158,7 +160,12 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 	const now = () => Date.now();
 
 	function rebuild() {
-		ledger = buildLedger(samples);
+		// Older releases declared Codex as 5m. Correct that metadata in memory;
+		// never rewrite or delete historical session entries.
+		ledger = buildLedger(samples.map<Sample>(s => {
+			const model = { id: s.model.split("/").slice(1).join("/"), api: s.api };
+			return openAi30m(model) ? { ...s, requested: "30m", declaredTtlMs: OPENAI_TTL_MS } : s;
+		}));
 	}
 
 	function cancelReplay(clearSnapshot = true) {
@@ -173,8 +180,11 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 
 	function record(sample: Sample) {
 		if (!validSample(sample)) return;
-		if (samples.some((s) => s.id === sample.id)) return;
-		samples.push(sample);
+		const prior = samples.findLast(s => s.id === sample.id);
+		if (prior) {
+			if (!prior.usageUnknown || sample.usageUnknown || prior.kind !== sample.kind || prior.model !== sample.model || prior.startedAt !== sample.startedAt) return;
+			samples = samples.map(s => s.id === sample.id ? sample : s);
+		} else samples.push(sample);
 		rebuild();
 		try {
 			const { miss: _miss, ...persisted } = sample;
@@ -224,23 +234,41 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 	// ------------------------------------------------------------------ TTL
 
 	function defaultTtl(): { value: Ttl; source: string } {
+		if (openAi30m(ctx?.model)) return { value: "30m", source: "OpenAI GPT-5.6+ fixed 30-minute cache policy" };
 		const setting = isChild ? settings.subagent_cache_ttl : settings.cache_ttl;
 		if (setting !== "default") return { value: setting, source: `${isChild ? "subagent" : "main conversation"} TTL in /keepalive-settings` };
 		if (process.env.PI_CACHE_RETENTION === "long") return { value: "1h", source: "pi default (PI_CACHE_RETENTION=long)" };
 		return { value: "5m", source: "pi default (short cache retention)" };
 	}
 
-	const effectiveTtl = (): Ttl => ttlChoice ?? defaultTtl().value;
+	const effectiveTtl = (): Ttl => openAi30m(ctx?.model) ? "30m" : ttlChoice ?? defaultTtl().value;
 
 	function ttlSupported(model = ctx?.model): boolean {
 		return model?.api === "anthropic-messages" && (model?.compat as any)?.supportsLongCacheRetention !== false;
 	}
 
 	function declaredTtlMs(model: any, requested: Ttl | undefined): number | undefined {
+		if (openAi30m(model)) return OPENAI_TTL_MS;
 		const tier = requested ? (requested === "1h" ? "long" : "short") : process.env.PI_CACHE_RETENTION === "long" ? "long" : "short";
 		const seconds = model?.promptCache?.[tier];
 		const ms = typeof seconds === "number" ? Math.round(seconds * 1000) : NaN;
 		return Number.isSafeInteger(ms) && ms > 0 ? ms : undefined;
+	}
+
+	function nativeTtlMismatch(): boolean {
+		if (openAi30m(ctx?.model)) {
+			const tier = process.env.PI_CACHE_RETENTION === "long" ? "long" : "short";
+			return (ctx?.model as any)?.promptCache?.[tier] !== OPENAI_TTL_MS / 1000;
+		}
+		return ttlSupported() && effectiveTtl() !== (process.env.PI_CACHE_RETENTION === "long" ? "1h" : "5m");
+	}
+
+	function warmOverhead(): number {
+		if (!openAi30m(ctx?.model) || !price?.value) return 0;
+		// Reserve for the appended suffix and generation, including reasoning.
+		// Codex has no enforced output cap; its reserve is an estimate.
+		return (ledger.last?.fresh ?? 0) + 64 * Math.max(1, price.value.fiveMinute ?? 1) +
+			(openAiOutputReserve(ctx?.model, snapshot?.payload) - 1) * price.value.output;
 	}
 
 	// --------------------------------------------------------------- prices
@@ -249,7 +277,7 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 		const model = ctx?.model;
 		const last = ledger.last;
 		if (!model || !last) return;
-		const contextTokens = last.read + last.write + last.fresh;
+		const contextTokens = last.read + last.write + last.fresh + (openAi30m(model) ? 64 : 0);
 		const key = `${model.provider}/${model.id}:${contextTokens}`;
 		if (price?.key === key && (price.lookup || now() - price.at < PRICE_REFRESH_MS)) return price.lookup;
 		const entry: NonNullable<typeof price> = { key, value: price?.key === key ? price.value : null, at: now() };
@@ -275,11 +303,16 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 
 	function replayable(): { ok: boolean; reason?: string } {
 		if (!snapshot) return { ok: false, reason: "no request captured since start, compaction, branch or thinking change" };
-		if (snapshot.api !== "anthropic-messages") return { ok: false, reason: `not supported for ${snapshot.api}` };
 		const model = ctx?.model;
-		if (!model || model.provider !== snapshot.provider || model.id !== snapshot.modelId)
+		if (!model || model.provider !== snapshot.provider || model.id !== snapshot.modelId || model.api !== snapshot.api)
 			return { ok: false, reason: "model changed since the last request" };
-		if (!payloadTtl(snapshot.payload)) return { ok: false, reason: "the request disabled prompt caching" };
+		if (openAi30m(model)) {
+			const reason = openAiReplayReason(model, snapshot.payload);
+			if (reason) return { ok: false, reason };
+		} else {
+			if (snapshot.api !== "anthropic-messages") return { ok: false, reason: `not supported for ${snapshot.api}` };
+			if (!payloadTtl(snapshot.payload)) return { ok: false, reason: "the request disabled prompt caching" };
+		}
 		if (!snapshot.confirmed || snapshot.capturedAt !== ledger.last?.startedAt)
 			return { ok: false, reason: "the latest request did not confirm cache activity" };
 		return { ok: true };
@@ -293,19 +326,30 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 			notes.set("keepalive", `keepalive skipped: ${snap.provider}/${snap.modelId} is not in the model registry`);
 			return;
 		}
-		const payload = structuredClone(snap.payload);
+		if (model.api !== snap.api) {
+			notes.set("keepalive", "keepalive skipped: provider API changed since capture");
+			return;
+		}
+		const openai = openAi30m(model);
+		const payload = openai ? openAiReplay(model, snap.payload) : structuredClone(snap.payload);
 		if (ttlSupported(model)) setPayloadTtl(payload, effectiveTtl());
-		const requested = payloadTtl(payload);
+		const requested: Ttl | undefined = openai ? "30m" : payloadTtl(payload);
 		// Budget-based thinking keys the cache on budget_tokens, so it must stay; max_tokens must exceed it.
 		// The stream is aborted as soon as message_start reports usage, so almost nothing is generated.
 		const budget = payload.thinking?.type === "enabled" && Number.isFinite(payload.thinking.budget_tokens) ? payload.thinking.budget_tokens : undefined;
-		payload.max_tokens = budget ? budget + 1 : 1;
+		if (!openai) payload.max_tokens = budget ? budget + 1 : 1;
 		const controller = new AbortController();
 		keepaliveAbort = controller;
 		const timeout = setTimeout(() => controller.abort(), KEEPALIVE_TIMEOUT_MS);
 		let start: any;
 		let delta: any;
+		let numbers: ReturnType<typeof openAiUsage>;
 		const startedAt = now();
+		const id = uid("keepalive");
+		// Persist an unknown-cost attempt before dispatch: cancellation/reload must
+		// not erase an unfinished request and silently treat it as free.
+		if (openai) record({ id, kind: "keepalive", via: "keepalive", model: `${snap.provider}/${snap.modelId}`, api: snap.api,
+			startedAt, read: 0, write: 0, fresh: 0, output: 0, requested, declaredTtlMs: OPENAI_TTL_MS, usageUnknown: true });
 		busy = "keepalive";
 		redraw();
 		try {
@@ -315,6 +359,7 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 				{
 					maxTokens: 1,
 					maxRetries: 0,
+					...(openai ? { transport: "sse" } : {}), // do not disturb the user's live Codex WebSocket session
 					signal: controller.signal,
 					sessionId: c.sessionManager.getSessionId(),
 					reasoning: c.thinkingLevel && c.thinkingLevel !== "off" ? c.thinkingLevel : undefined,
@@ -324,11 +369,22 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 							start = data.message?.usage;
 							if (budget) controller.abort();
 						} else if (data?.type === "message_delta" && data.usage) delta = data.usage;
+						if (openai && /^response\.(completed|done|incomplete|failed)$/.test(data?.type ?? "")) {
+							numbers = openAiUsage(data.response?.usage) ?? numbers;
+							if (numbers && runRevision === revision && ctx) record({ id, kind: "keepalive", via: "keepalive",
+								model: `${snap.provider}/${snap.modelId}`, api: snap.api, startedAt, completedAt: now(), ...numbers,
+								requested, declaredTtlMs: OPENAI_TTL_MS, usageUnknown: false });
+						}
 					},
 				} as any,
 			);
 			const result: any = await stream.result();
-			if (runRevision === revision && !start && result?.errorMessage) notes.set("keepalive", `last keepalive failed: ${String(result.errorMessage).slice(0, 160)}`);
+			if (openai && !numbers && result?.usage) {
+				const u = result.usage;
+				numbers = openAiUsage({ input_tokens: (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0),
+					input_tokens_details: { cached_tokens: u.cacheRead ?? 0, cache_write_tokens: u.cacheWrite ?? 0 }, output_tokens: u.output ?? 0 });
+			}
+			if (runRevision === revision && !start && !numbers && result?.errorMessage) notes.set("keepalive", `last keepalive failed: ${String(result.errorMessage).slice(0, 160)}`);
 		} catch (error: any) {
 			if (runRevision === revision && !start) notes.set("keepalive", `last keepalive failed: ${String(error?.message ?? error).slice(0, 160)}`);
 		} finally {
@@ -340,26 +396,29 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 		}
 		// A late response must not update a different branch/model/session or supersede a real turn.
 		if (runRevision !== revision || !ctx) return;
-		if (!start) {
+		if (openai ? !numbers : !start) {
+			if (openai) notes.set("keepalive", "keepalive ended without billing usage; cost is unknown and the price budget is exhausted");
 			redraw();
-			return;
+			return openai ? false : undefined;
 		}
 		notes.delete("keepalive");
-		const numbers = usageNumbers(start, delta);
+		const counted = openai ? numbers! : usageNumbers(start, delta);
 		const creation = reportedCreation(delta?.cache_creation ? delta : start);
 		record({
-			id: uid("keepalive"),
+			id,
 			kind: "keepalive",
 			via: "keepalive",
 			model: `${snap.provider}/${snap.modelId}`,
 			api: snap.api,
 			startedAt,
 			completedAt: now(),
-			...numbers,
+			...counted,
+			...(openai ? { usageUnknown: false } : {}),
 			...(creation ? { creation } : {}),
 			...(requested ? { requested } : {}),
 			declaredTtlMs: declaredTtlMs(model, requested),
 		});
+		return counted.read + counted.write > 0;
 	}
 
 	function compact(c: ExtensionContext) {
@@ -377,7 +436,7 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 					compacting = false;
 					compactStartedAt = undefined;
 					notes.delete("compact");
-					if (c.hasUI) c.ui.notify(`Keepalive compacted the conversation (${cacheTokens(before)} tokens) before its prompt cache expired.`, "info");
+					if (c.hasUI) c.ui.notify(`Keepalive compacted model context (${cacheTokens(before)} tokens). Full chat history remains saved: /tree or /export.`, "info");
 					redraw();
 				},
 				onError: (error: Error) => {
@@ -429,14 +488,16 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 			const last = ledger.last!;
 			if (!ctx.model || `${ctx.model.provider}/${ctx.model.id}` !== last.model) return;
 			if (warms && replayable().ok) {
-				const left = keepalivesLeft(ledger, price?.value, limit, effectiveTtl() === "1h");
+				const left = keepalivesLeft(ledger, price?.value, limit, effectiveTtl() === "1h", warmOverhead());
 				if (left !== null && left > 0) {
 					notes.delete("upkeep");
-					await sendKeepalive(c);
+					const warmed = await sendKeepalive(c);
+					if (warmed === false && mode === "warmcomp" && limit !== Infinity && runRevision === revision && idle() &&
+						last.read + last.write + last.fresh >= thresholdOf(settings)) compact(c);
 					return;
 				}
 			}
-			if (mode !== "warm" && last.read + last.write + last.fresh >= thresholdOf(settings)) return compact(c);
+			if (mode !== "warm" && (mode === "compact" || limit !== Infinity) && last.read + last.write + last.fresh >= thresholdOf(settings)) return compact(c);
 			if (warms) notes.set("upkeep", !replayable().ok
 				? `warming skipped: ${replayable().reason}`
 				: limit !== undefined ? `warming stopped at the keepalive limit of ${limit}`
@@ -456,7 +517,7 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 		const parts = [`${warming} (settings.json cacheWarming)`];
 		if (warming !== "off" && !model?.promptCache) parts.push("inactive: model declares no promptCache lifetime");
 		if (warming === "idle" && mode !== "off") parts.push("idle refreshes left to keepalive");
-		if (ttlSupported() && effectiveTtl() !== (process.env.PI_CACHE_RETENTION === "long" ? "1h" : "5m"))
+		if (nativeTtlMismatch())
 			parts.push("refreshes skipped: native schedule does not match the selected TTL");
 		return parts.join(" · ");
 	}
@@ -486,7 +547,7 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 		const limit = limitOf(settings);
 		const warms = mode === "warm" || mode === "warmcomp";
 		if (warms && limit === undefined && ledger.last) ensurePrices();
-		const left = keepalivesLeft(ledger, price?.value, limit, effectiveTtl() === "1h");
+		const left = keepalivesLeft(ledger, price?.value, limit, effectiveTtl() === "1h", warmOverhead());
 		const last = ledger.last;
 		const def = defaultTtl();
 		const viewNotes = [...notes.values()];
@@ -498,7 +559,8 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 			ledger,
 			status,
 			mode,
-			ttl: { value: effectiveTtl(), source: ttlChoice ? "chosen for this session" : def.source, chosen: !!ttlChoice, supported: ttlSupported() },
+			ttl: { value: effectiveTtl(), source: ttlChoice && !openAi30m(ctx?.model) ? "chosen for this session" : def.source,
+				chosen: !!ttlChoice && !openAi30m(ctx?.model), supported: ttlSupported(), fixed: openAi30m(ctx?.model) },
 			left,
 			compactable: !!last && last.read + last.write + last.fresh >= thresholdOf(settings),
 			limit,
@@ -539,7 +601,7 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 
 	function toggleTtl() {
 		if (!ttlSupported()) {
-			ctx?.hasUI && ctx.ui.notify("Keepalive: the cache TTL can only be set for Anthropic Messages models.", "warning");
+			ctx?.hasUI && ctx.ui.notify(openAi30m(ctx.model) ? "Keepalive: OpenAI uses a fixed 30-minute cache horizon." : "Keepalive: the cache TTL can only be set for Anthropic Messages models.", "warning");
 			return;
 		}
 		setTtl(effectiveTtl() === "5m" ? "1h" : "5m");
@@ -688,12 +750,21 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 		const model: any = c.model;
 		const anthropic = isAnthropicPayload(payload);
 		// pi's own cache warmer replays the last request with a one-token cap; idle replays happen outside a run.
-		const kind: PendingRequest["kind"] = !agentRunning || (nativeRefresh && anthropic && payload.max_tokens === 1) ? "pi-warmer" : "real";
+		const kind: PendingRequest["kind"] = !agentRunning || (nativeRefresh && ((anthropic && payload.max_tokens === 1) || openAi30m(model))) ? "pi-warmer" : "real";
 		nativeRefresh = false;
 		let requested: Ttl | undefined;
 		if (anthropic) {
 			if (ttlSupported(model) && payloadTtl(payload)) setPayloadTtl(payload, effectiveTtl());
 			requested = payloadTtl(payload);
+		} else if (openAi30m(model)) {
+			requested = "30m";
+			// Codex/ChatGPT sign-in omit these fields. Only public Responses payloads
+			// already advertising retention/output-limit support receive an explicit TTL.
+			if (model.api === "openai-responses" && model.compat?.supportsExplicitPromptCacheMode !== false &&
+				(payload.prompt_cache_options || Number.isSafeInteger(payload.max_output_tokens)) && openAiCaching(payload)) {
+				delete payload.prompt_cache_retention;
+				payload.prompt_cache_options = { ...payload.prompt_cache_options, ttl: "30m" };
+			}
 		}
 		// Use the registry id, not a gateway's wire alias, when looking the model up later.
 		const modelId = model?.id ?? "unknown";
@@ -708,7 +779,7 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 			declaredTtlMs: declaredTtlMs(model, requested),
 		});
 		if (kind === "real") {
-			if (anthropic) {
+			if (anthropic || openAi30m(model)) {
 				try {
 					snapshot = { payload: structuredClone(payload), provider, modelId, api: model?.api, capturedAt: startedAt, confirmed: false };
 				} catch {
@@ -727,7 +798,16 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 		const data: any = event.data;
 		if (!data || typeof data !== "object") return;
 		const matches = (p: PendingRequest) => p.api === event.api && p.model === `${event.provider}/${event.model}`;
-		if (data.type === "message_start") {
+		if (/^response\.(completed|done|incomplete)$/.test(data.type ?? "")) {
+			const rec = [...pending].reverse().find(p => matches(p) && !p.done);
+			const numbers = openAiUsage(data.response?.usage);
+			if (rec?.kind === "real" && numbers) rec.responseUsage = numbers;
+			if (rec?.kind === "pi-warmer" && numbers) {
+				rec.done = true;
+				record({ id: uid("pi-warm"), kind: "keepalive", via: "pi-warmer", model: rec.model, api: rec.api,
+					startedAt: rec.startedAt, completedAt: now(), ...numbers, requested: rec.requested, declaredTtlMs: rec.declaredTtlMs });
+			}
+		} else if (data.type === "message_start") {
 			// Ignore side-channel streams from a different model or provider.
 			const rec = [...pending].reverse().find((p) => matches(p) && !p.started && !p.done);
 			if (!rec) return;
@@ -769,10 +849,10 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 		pending = pending.filter((p) => !p.done);
 		const usage = message.usage;
 		if (!usage) return;
-		const read = usage.cacheRead ?? 0;
-		const write = usage.cacheWrite ?? 0;
-		const fresh = usage.input ?? 0;
-		const output = usage.output ?? 0;
+		const read = rec.responseUsage?.read ?? usage.cacheRead ?? 0;
+		const write = rec.responseUsage?.write ?? usage.cacheWrite ?? 0;
+		const fresh = rec.responseUsage?.fresh ?? usage.input ?? 0;
+		const output = rec.responseUsage?.output ?? usage.output ?? 0;
 		if ([read, write, fresh, output].some((v) => !Number.isSafeInteger(v) || v < 0) || read + write + fresh + output === 0) {
 			redraw();
 			return;
@@ -844,7 +924,7 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 		if (!agentRunning && mode !== "off") return { action: "stop" };
 		// The native schedule comes from PI_CACHE_RETENTION, not our rewritten payload.
 		// Either mismatch can cause needless refreshes or a full-price write after expiry.
-		if (ttlSupported() && effectiveTtl() !== (process.env.PI_CACHE_RETENTION === "long" ? "1h" : "5m")) return { action: "stop" };
+		if (nativeTtlMismatch()) return { action: "stop" };
 		nativeRefresh = event.action === "warm";
 		return undefined;
 	});
@@ -852,9 +932,9 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 	// ------------------------------------------------------------- commands
 
 	pi.registerCommand("keepalive", {
-		description: "Prompt cache dashboard; /keepalive mode <off|warm|compact|warmcomp>, /keepalive ttl <5m|1h|default>",
+		description: "Prompt cache dashboard; /keepalive mode <off|warm|compact|warmcomp>, /keepalive ttl <5m|30m|1h|default> (30m is fixed for OpenAI GPT-5.6+)",
 		getArgumentCompletions: (prefix: string) => {
-			const options = ["mode off", "mode warm", "mode compact", "mode warmcomp", "ttl 5m", "ttl 1h", "ttl default", "status"];
+			const options = ["mode off", "mode warm", "mode compact", "mode warmcomp", "ttl 5m", "ttl 30m", "ttl 1h", "ttl default", "status"];
 			const items = options.filter((o) => o.startsWith(prefix.trim())).map((o) => ({ value: o, label: o }));
 			return items.length ? items : null;
 		},
@@ -873,11 +953,12 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 			}
 			if (verb === "ttl") {
 				if (value === "default") setTtl(undefined);
+				else if (value === "30m" && openAi30m(c.model)) return c.ui.notify("Keepalive TTL: 30m (fixed OpenAI cache policy)", "info");
 				else if (value === "5m" || value === "1h") {
-					if (!ttlSupported()) return c.ui.notify("Keepalive: the cache TTL can only be set for Anthropic Messages models.", "warning");
+					if (!ttlSupported()) return c.ui.notify(openAi30m(c.model) ? "Keepalive: OpenAI uses a fixed 30-minute cache horizon." : "Keepalive: the cache TTL can only be set for Anthropic Messages models.", "warning");
 					setTtl(value);
 				} else if (!value) toggleTtl();
-				else return c.ui.notify("Usage: /keepalive ttl <5m|1h|default>", "warning");
+				else return c.ui.notify("Usage: /keepalive ttl <5m|30m|1h|default> (30m is fixed for OpenAI GPT-5.6+)", "warning");
 				return c.ui.notify(`Keepalive TTL: ${effectiveTtl()} (${ttlChoice ? "this session" : defaultTtl().source})`, "info");
 			}
 			if (c.mode === "tui" && verb !== "status") return openDashboard(c);
@@ -904,8 +985,8 @@ export default function keepalive(pi: ExtensionAPI, options: { subagent?: boolea
 				settings = loadSettings(c.cwd, trusted(c));
 				const def = process.env.PI_CACHE_RETENTION === "long" ? "1h" : "5m";
 				const rows: [string, keyof KeepaliveSettings, string][] = [
-					["Main conversation TTL", "cache_ttl", settings.cache_ttl === "default" ? `default (${def})` : settings.cache_ttl],
-					["Subagent TTL", "subagent_cache_ttl", settings.subagent_cache_ttl === "default" ? `default (${def})` : settings.subagent_cache_ttl],
+					["Main conversation TTL (Anthropic)", "cache_ttl", settings.cache_ttl === "default" ? `default (${def})` : settings.cache_ttl],
+					["Subagent TTL (Anthropic)", "subagent_cache_ttl", settings.subagent_cache_ttl === "default" ? `default (${def})` : settings.subagent_cache_ttl],
 					["Main conversation upkeep", "cache_upkeep", settings.cache_upkeep],
 					["Keepalive limit", "keepalive_limit", settings.keepalive_limit],
 					["Compaction threshold", "compact_threshold", settings.compact_threshold],

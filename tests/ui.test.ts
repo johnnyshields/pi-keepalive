@@ -30,6 +30,13 @@ test("upkeep labels use a spaced keepalive count and comp, including infinity", 
 	assert.ok(renderBar(theme, { ...view, status: { ...view.status, state: "compacted", compacted: { before: 100_000, after: 10_000 } } }, 200).line.includes("comp ✓"));
 });
 
+test("fixed OpenAI TTL is visible before observations and has no toggle hit area", () => {
+	const fixed = { ...view, ttl: { value: "30m", source: "OpenAI policy", chosen: false, supported: false, fixed: true } };
+	const out = renderBar(theme, fixed, 200);
+	assert.ok(out.line.includes("TTL 30m"));
+	assert.equal(out.segments.some(s => s.action === "ttl"), false);
+});
+
 test("dashboard respects narrow terminal widths and keyboard controls", () => {
 	let closes = 0, modes = 0, ttls = 0;
 	const dashboard = new Dashboard(theme, () => view, { close: () => { closes++; }, cycleMode: () => { modes++; }, toggleTtl: () => { ttls++; }, render: () => {} });

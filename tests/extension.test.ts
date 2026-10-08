@@ -46,8 +46,14 @@ async function harness(t: TestContext, config: Record<string, unknown> = {}, chi
 			streamSimple: (_model: any, _context: any, options: any) => {
 				const payload = options.onPayload();
 				calls.push({ payload, options });
-				options.onProviderStreamEvent({ type: "message_start", message: { usage: { input_tokens: 0, cache_read_input_tokens: currentPrefix, cache_creation_input_tokens: 0, output_tokens: 1 } } });
-				return { result: () => defer ? new Promise((r) => { release = () => r({}); }) : Promise.resolve({}) };
+				const openai = _model.api !== "anthropic-messages";
+				if (!openai) options.onProviderStreamEvent({ type: "message_start", message: { usage: { input_tokens: 0, cache_read_input_tokens: currentPrefix, cache_creation_input_tokens: 0, output_tokens: 1 } } });
+				const reply = () => {
+					if (openai) options.onProviderStreamEvent({ type: "response.completed", response: { usage: { input_tokens: currentPrefix + 25,
+						input_tokens_details: { cached_tokens: currentPrefix, cache_write_tokens: 20 }, output_tokens: 8 } } });
+					return {};
+				};
+				return { result: () => defer ? new Promise((r) => { release = () => r(reply()); }) : Promise.resolve(reply()) };
 			},
 		},
 	};
@@ -378,4 +384,155 @@ test("TTL rewrites include request-level caching and native schedule mismatches 
 	process.env.PI_CACHE_RETENTION = "long";
 	await h.commands.get("keepalive").handler("ttl 5m", h.c);
 	assert.deepEqual(await h.emit("cache_warming_decision", { action: "warm" }), { action: "stop" });
+});
+
+async function openAiReal(h: Awaited<ReturnType<typeof harness>>, api: string, patch: any = {}, fresh = 0) {
+	Object.assign(h.c.model, { id: "gpt-6-sol", api, promptCache: { short: 300 } }); // stale user metadata must not shorten the horizon
+	await h.emit("agent_start");
+	const payload: any = { model: "gpt-6-sol", input: [{ role: "user", content: [{ type: "input_text", text: "original question" }] }],
+		instructions: "original instructions", reasoning: { effort: "high" }, prompt_cache_key: "stable-session-key",
+		tools: [{ type: "function", name: "test", parameters: { type: "object" } }],
+		...(api === "openai-responses" ? { max_output_tokens: 4096 } : {}), ...patch };
+	await h.emit("before_provider_request", { payload });
+	await h.emit("message_end", { message: { role: "assistant", provider: h.c.model.provider, model: h.c.model.id, api,
+		responseId: `openai:${Date.now()}`, usage: { input: fresh, cacheRead: 0, cacheWrite: 10_000, output: 1 } } });
+	await h.emit("agent_settled");
+	return payload;
+}
+
+for (const api of ["openai-responses", "openai-codex-responses"]) {
+	for (const child of [false, true, "in-process"] as const) {
+		for (const mode of ["off", "warm", "compact", "warmcomp"]) {
+			test(`${api} ${child || "main"}: ${mode} follows the fixed 30m horizon`, async t => {
+				const h = await harness(t, { cache_upkeep: mode, keepalive_limit: "1", compact_threshold: "1k", cache_ttl: "1h", subagent_cache_ttl: "5m" }, child);
+				const original = await openAiReal(h, api);
+				await h.tick(1_769_000);
+				assert.equal(h.calls.length + h.compactions(), 0);
+				await h.tick(1000);
+				const warms = mode === "warm" || mode === "warmcomp";
+				assert.equal(h.calls.length, warms ? 1 : 0);
+				assert.equal(h.compactions(), mode === "compact" ? 1 : 0);
+				if (warms) {
+					const p = h.calls[0].payload;
+					assert.deepEqual(p.input.slice(0, original.input.length), original.input);
+					for (const key of ["instructions", "reasoning", "tools", "prompt_cache_key"]) assert.deepEqual(p[key], original[key]);
+					assert.equal(p.max_output_tokens, api === "openai-responses" ? 16 : undefined);
+					assert.equal(p.max_tokens, undefined);
+					assert.equal(h.calls[0].options.transport, "sse");
+					const completed = h.entries.findLast(e => e.data?.kind === "keepalive").data;
+					assert.equal(completed.usageUnknown, false);
+					assert.equal(completed.write, 20); assert.equal(completed.fresh, 5); assert.equal(completed.output, 8);
+				}
+				await h.tick(1_770_000);
+				assert.equal(h.calls.length, warms ? 1 : 0);
+				assert.equal(h.compactions(), mode === "compact" || mode === "warmcomp" ? 1 : 0);
+				await h.commands.get("keepalive").handler("status", h.c);
+				assert.ok(h.notices.at(-1)?.includes("TTL 30m"));
+			});
+		}
+	}
+	test(`${api}: default pricing eventually exhausts the warming budget`, async t => {
+		const h = await harness(t, { keepalive_limit: "default" });
+		await openAiReal(h, api);
+		for (let i = 0; i < 30; i++) await h.tick(1_770_000);
+		assert.ok(h.calls.length > 0 && h.calls.length < 15);
+		await h.commands.get("keepalive").handler("status", h.c);
+		assert.ok(h.notices.at(-1)?.includes("rewriting the cache"));
+	});
+	test(`${api}: missing usage consumes the price budget and warmcomp can compact`, async t => {
+		const h = await harness(t, { cache_upkeep: "warmcomp", keepalive_limit: "default", compact_threshold: "1k" });
+		t.mock.method(h.c.modelRegistry, "streamSimple", (_m: any, _c: any, opts: any) => {
+			h.calls.push({ payload: opts.onPayload(), options: opts });
+			return { result: async () => ({ errorMessage: "lost connection" }) };
+		});
+		await openAiReal(h, api); await h.tick(1_770_000);
+		assert.equal(h.calls.length, 1); assert.equal(h.compactions(), 1);
+		assert.equal(h.entries.findLast(e => e.data?.kind === "keepalive").data.usageUnknown, true);
+		await h.tick(1000); assert.equal(h.calls.length, 1);
+	});
+	test(`${api}: real turns cancel probes and retain unknown spend, not a false TTL refresh`, async t => {
+		const h = await harness(t);
+		await openAiReal(h, api); h.defer(); await h.tick(1_770_000);
+		await h.emit("agent_start");
+		assert.equal(h.calls[0].options.signal.aborted, true);
+		await h.release();
+		assert.equal(h.entries.findLast(e => e.data?.kind === "keepalive").data.usageUnknown, true);
+	});
+	test(`${api}: cache opt-out is preserved`, async t => {
+		const h = await harness(t);
+		const payload = await openAiReal(h, api, { prompt_cache_options: { mode: "explicit" } });
+		assert.equal(payload.prompt_cache_options.mode, "explicit");
+		await h.tick(1_770_000); assert.equal(h.calls.length, 0);
+	});
+}
+
+test("raw OpenAI usage supplies cache writes even when older host normalization omits them", async t => {
+	const h = await harness(t);
+	Object.assign(h.c.model, { id: "gpt-6-sol", api: "openai-responses" });
+	await h.emit("agent_start");
+	await h.emit("before_provider_request", { payload: { model: h.c.model.id, input: [], max_output_tokens: 4096 } });
+	await h.raw({ type: "response.completed", response: { usage: { input_tokens: 10_005,
+		input_tokens_details: { cache_write_tokens: 10_000 }, output_tokens: 1 } } });
+	await h.emit("message_end", { message: { role: "assistant", provider: "test", model: h.c.model.id,
+		usage: { input: 10_005, cacheWrite: 0, cacheRead: 0, output: 1 } } });
+	await h.emit("agent_settled");
+	const saved = h.entries.at(-1).data;
+	assert.equal(saved.write, 10_000); assert.equal(saved.fresh, 5);
+	await h.tick(1_770_000); assert.equal(h.calls.length, 1);
+});
+
+test("OpenAI default budget reserves uncached input rather than replaying an expensive suffix", async t => {
+	const h = await harness(t, { keepalive_limit: "default" });
+	await openAiReal(h, "openai-codex-responses", {}, 50_000);
+	await h.tick(1_770_000);
+	assert.equal(h.calls.length, 0);
+});
+
+test("OpenAI native warming uses actual 30m metadata and is accounted once", async t => {
+	const h = await harness(t);
+	await openAiReal(h, "openai-codex-responses");
+	await h.emit("agent_start");
+	assert.deepEqual(await h.emit("cache_warming_decision", { action: "warm" }), { action: "stop" });
+	h.c.model.promptCache = { short: 1800, long: 1800 };
+	assert.equal(await h.emit("cache_warming_decision", { action: "warm" }), undefined);
+	await h.emit("before_provider_request", { payload: { model: h.c.model.id, input: [] } });
+	const data = { type: "response.done", response: { usage: { input_tokens: 10_000, input_tokens_details: { cached_tokens: 10_000 }, output_tokens: 1 } } };
+	await h.raw(data); await h.raw(data);
+	assert.equal(h.entries.filter(e => e.data?.via === "pi-warmer").length, 1);
+});
+
+test("infinite OpenAI warming never falls back to compaction after a failed probe", async t => {
+	const h = await harness(t, { cache_upkeep: "warmcomp", keepalive_limit: "infinite", compact_threshold: "1k" });
+	t.mock.method(h.c.modelRegistry, "streamSimple", () => ({ result: async () => ({}) }));
+	await openAiReal(h, "openai-codex-responses");
+	await h.tick(1_770_000);
+	assert.equal(h.compactions(), 0);
+});
+
+test("old Codex 5m metadata is migrated in memory without rewriting saved history", async t => {
+	const h = await harness(t);
+	Object.assign(h.c.model, { id: "gpt-6-sol", api: "openai-codex-responses" });
+	const stored = { id: "old-codex", kind: "real", model: "test/gpt-6-sol", api: "openai-codex-responses",
+		startedAt: Date.now(), read: 10_000, write: 0, fresh: 0, output: 1, declaredTtlMs: 300_000 };
+	h.entries.push({ type: "custom", customType: "keepalive-sample", data: stored });
+	await h.emit("session_start");
+	await h.tick(270_000);
+	await h.commands.get("keepalive").handler("status", h.c);
+	assert.ok(h.notices.at(-1)?.includes("1530s left"));
+	assert.equal(stored.declaredTtlMs, 300_000);
+	assert.equal(h.calls.length, 0);
+});
+
+test("OpenAI TTL is fixed without discarding the session's Anthropic TTL choice", async t => {
+	const h = await harness(t);
+	await h.commands.get("keepalive").handler("ttl 1h", h.c);
+	await openAiReal(h, "openai-responses");
+	await h.commands.get("keepalive").handler("ttl 5m", h.c);
+	assert.ok(h.notices.at(-1)?.includes("fixed 30-minute"));
+	await h.commands.get("keepalive").handler("ttl 30m", h.c);
+	assert.ok(h.notices.at(-1)?.includes("30m"));
+	Object.assign(h.c.model, { id: "claude-sonnet-4-5", api: "anthropic-messages" });
+	await h.emit("model_select");
+	await h.commands.get("keepalive").handler("status", h.c);
+	assert.ok(h.notices.at(-1)?.includes("TTL 1h"));
 });

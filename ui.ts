@@ -35,7 +35,7 @@ export interface View {
 	status: Status;
 	/** null: this session has no upkeep (subagent child). */
 	mode: Upkeep | null;
-	ttl: { value: Ttl; source: string; chosen: boolean; supported: boolean };
+	ttl: { value: Ttl; source: string; chosen: boolean; supported: boolean; fixed?: boolean };
 	/** Keepalives left before stopping/compacting; null when nothing to warm; Infinity for infinite. */
 	left: number | null;
 	/** warmcomp/compact will compact this conversation (it is over the threshold). */
@@ -122,7 +122,7 @@ export function renderBar(theme: Theme, v: View, width: number): { line: string;
 	push(" ");
 	push(modeChip(theme, v.mode), v.mode === null ? undefined : "mode");
 	push(" ");
-	const ttlText = v.ttl.supported ? `TTL ${v.ttl.value}` : `TTL ${s.ttl ?? "–"}`;
+	const ttlText = v.ttl.supported || v.ttl.fixed ? `TTL ${v.ttl.value}` : `TTL ${s.ttl ?? "–"}`;
 	push(v.ttl.supported ? theme.style(ttlText, { fg: "accent", underline: true }) : theme.fg("dim", ttlText), v.ttl.supported ? "ttl" : undefined);
 	if (s.ttl && v.ttl.supported && s.basis === "reported" && s.ttl !== v.ttl.value) push(theme.fg("dim", ` · ${s.ttl} reported`));
 	push(" ");
@@ -243,9 +243,9 @@ export function renderDashboard(theme: Theme, v: View, filter: RequestFilter, wi
 	const s = v.status;
 	const ttlState =
 		s.state === "warm"
-			? `${s.ttl}${s.basis === "reported" ? " reported" : s.basis === "declared" ? " declared in models.json" : " requested, awaiting report"} · ETA ~${cacheClock(s.leftMs ?? 0)}`
+			? `${s.ttl}${s.basis === "reported" ? " reported" : s.basis === "declared" ? " declared by model/provider policy" : " requested, awaiting report"} · ETA ~${cacheClock(s.leftMs ?? 0)}`
 			: s.state;
-	lines.push(`${label("TTL")}${v.ttl.value}${v.ttl.supported ? "" : " (not settable for this API)"} · ${v.ttl.source} · ${ttlState}`);
+	lines.push(`${label("TTL")}${v.ttl.value}${v.ttl.fixed ? " (provider-fixed)" : v.ttl.supported ? "" : " (not settable for this API)"} · ${v.ttl.source} · ${ttlState}`);
 	lines.push(`${label("Upkeep")}${modeChip(theme, v.mode)} · ${describeUpkeep(v).replace(/^\w+ · /, "")}`);
 	lines.push(`${label("Prices")}${describePrices(v)}`);
 	if (v.spend) lines.push(`${label("Spent")}${v.spend}`);
@@ -281,7 +281,7 @@ export function renderDashboard(theme: Theme, v: View, filter: RequestFilter, wi
 		}
 	}
 	lines.push("");
-	lines.push(theme.fg("dim", "tab/r requests filter · m upkeep mode · t TTL 5m/1h · esc close"));
+	lines.push(theme.fg("dim", "tab/r requests filter · m upkeep mode · t TTL (Anthropic 5m/1h; OpenAI fixed 30m) · esc close"));
 	return lines.map((l) => truncateToWidth(l, width));
 }
 
